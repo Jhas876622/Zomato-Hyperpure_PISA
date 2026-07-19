@@ -545,6 +545,8 @@ def tab_alerts(active_lots):
 
     display_df["Days Left"] = display_df["Days Left"].astype(int)
     display_df["Qty (kg)"] = display_df["Qty (kg)"].round(1)
+    display_df["Value (₹)"] = display_df["Value (₹)"].apply(lambda x: f"₹{int(round(x)):,}")
+    display_df["Risk Score"] = display_df["Risk Score"].astype(int)
 
     st.dataframe(
         display_df,
@@ -556,14 +558,6 @@ def tab_alerts(active_lots):
                 format="%d%%",
                 min_value=0,
                 max_value=100,
-            ),
-            "Value (₹)": st.column_config.NumberColumn(
-                "Value (₹)",
-                format="₹%,.0f"
-            ),
-            "Risk Score": st.column_config.NumberColumn(
-                "Risk Score",
-                format="%d"
             )
         }
     )
