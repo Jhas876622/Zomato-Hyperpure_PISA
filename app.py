@@ -83,6 +83,44 @@ st.markdown("""
                     padding:10px 14px; border-radius:6px; margin:4px 0; }
   .stTabs [data-baseweb="tab"] { font-weight: 600; }
   .stTabs [data-baseweb="tab"][aria-selected="true"] { color: #CB202D; }
+  
+  /* Custom High-Fidelity KPI Cards */
+  .kpi-card {
+      background: #ffffff;
+      border-left: 5px solid #CB202D;
+      border-radius: 8px;
+      padding: 18px 22px;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.05);
+      margin-bottom: 14px;
+      border: 1px solid #F0F0F0;
+      border-left: 5px solid #CB202D;
+  }
+  .kpi-title {
+      font-size: 0.8rem;
+      color: #757575;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+  }
+  .kpi-value {
+      color: #1A1A1A;
+      font-size: 2.1rem;
+      font-weight: 800;
+      margin: 8px 0;
+  }
+  .kpi-delta {
+      font-size: 0.8rem;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+  }
+  .delta-good { color: #2E7D32; }
+  .delta-bad { color: #C62828; }
+  .kpi-critical { border-left: 5px solid #CC0000 !important; }
+  .kpi-high { border-left: 5px solid #E65100 !important; }
+  .kpi-medium { border-left: 5px solid #F9A825 !important; }
+  .kpi-low { border-left: 5px solid #2E7D32 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -176,10 +214,40 @@ def tab_overview(lot_df, demand_df, active_lots):
     at_risk_value    = active_lots[active_lots["risk_level"].isin(["CRITICAL","HIGH"])]["lot_value_inr"].sum()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🗑️ Wastage Rate",        f"{wastage_pct:.1f}%",  "-2.3pp vs last month", delta_color="inverse")
-    c2.metric("✅ Fill Rate",             f"{fill_rate:.1f}%",   "+1.1pp vs last month")
-    c3.metric("🔄 Inventory Turnover",   f"{inv_turnover}x",    "+0.4x vs last month")
-    c4.metric("⚠️ At-Risk Value Today",  f"₹{at_risk_value/1e5:.1f}L", f"{len(active_lots[active_lots['risk_level']=='CRITICAL'])} CRITICAL lots", delta_color="inverse")
+    with c1:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">🗑️ Wastage Rate</div>
+            <div class="kpi-value">{wastage_pct:.1f}%</div>
+            <div class="kpi-delta delta-good">▼ -2.3% vs last month</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">✅ Fill Rate</div>
+            <div class="kpi-value">{fill_rate:.1f}%</div>
+            <div class="kpi-delta delta-good">▲ +1.1% vs last month</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">🔄 Inventory Turnover</div>
+            <div class="kpi-value">{inv_turnover}x</div>
+            <div class="kpi-delta delta-good">▲ +0.4x vs last month</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c4:
+        # Determine number of critical lots dynamically
+        n_crit = len(active_lots[active_lots['risk_level']=='CRITICAL'])
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">⚠️ At-Risk Value Today</div>
+            <div class="kpi-value">₹{at_risk_value/1e5:.1f}L</div>
+            <div class="kpi-delta delta-bad">▲ {n_crit} CRITICAL lots</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("")
 
@@ -392,11 +460,46 @@ def tab_alerts(active_lots):
     val_at_risk= active_lots[active_lots["risk_level"].isin(["CRITICAL","HIGH"])]["lot_value_inr"].sum()
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("🔴 CRITICAL", n_critical, "Needs action NOW", delta_color="inverse")
-    c2.metric("🟠 HIGH",     n_high,     "Action today",     delta_color="inverse")
-    c3.metric("🟡 MEDIUM",   n_medium,   "Monitor closely")
-    c4.metric("🟢 LOW",      n_low,      "Safe")
-    c5.metric("💰 Value at Risk", f"₹{val_at_risk/1e5:.1f}L", "Critical + High lots")
+    with c1:
+        st.markdown(f"""
+        <div class="kpi-card kpi-critical">
+            <div class="kpi-title">🔴 CRITICAL</div>
+            <div class="kpi-value">{n_critical}</div>
+            <div class="kpi-delta delta-bad">Needs action NOW</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""
+        <div class="kpi-card kpi-high">
+            <div class="kpi-title">🟠 HIGH</div>
+            <div class="kpi-value">{n_high}</div>
+            <div class="kpi-delta delta-bad">Action today</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""
+        <div class="kpi-card kpi-medium">
+            <div class="kpi-title">🟡 MEDIUM</div>
+            <div class="kpi-value">{n_medium}</div>
+            <div class="kpi-delta delta-bad">Monitor closely</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c4:
+        st.markdown(f"""
+        <div class="kpi-card kpi-low">
+            <div class="kpi-title">🟢 LOW</div>
+            <div class="kpi-value">{n_low}</div>
+            <div class="kpi-delta delta-good">Safe</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c5:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">💰 Value at Risk</div>
+            <div class="kpi-value">₹{val_at_risk/1e5:.1f}L</div>
+            <div class="kpi-delta delta-bad">Critical & High lots</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     # Filter
     st.markdown("")
@@ -447,7 +550,24 @@ def tab_alerts(active_lots):
 
     st.dataframe(
         display_df.style.map(color_risk, subset=["Risk Level"]),
-        use_container_width=True, hide_index=True
+        use_container_width=True, hide_index=True,
+        column_config={
+            "% Shelf Life Left": st.column_config.ProgressColumn(
+                "% Shelf Life Left",
+                help="Percentage of shelf life remaining",
+                format="%d%%",
+                min_value=0,
+                max_value=100,
+            ),
+            "Value (₹)": st.column_config.NumberColumn(
+                "Value (₹)",
+                format="₹%,.0f"
+            ),
+            "Risk Score": st.column_config.NumberColumn(
+                "Risk Score",
+                format="%d"
+            )
+        }
     )
 
     # ── Risk Distribution Chart ──
