@@ -1459,8 +1459,7 @@ Bhagwan Parshuram Institute of Technology (BPIT), New Delhi
 ### Connect with me
 
 - **GitHub:** https://github.com/Jhas876622
-- **LinkedIn:** *(Add your LinkedIn profile URL here)*
-- **Email:** *(Add your professional email here)*
+- **Email:** *Jha876622@gmail.com*
 
 ---
 
