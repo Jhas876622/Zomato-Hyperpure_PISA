@@ -95,7 +95,7 @@ streamlit run app.py
 
 ---
 
-## 🔮 Future Enhancements (for interview discussion)
+## 🔮 Future Enhancements 
 1. **LightGBM / DeepAR** for multi-SKU global forecasting models
 2. **Cox Survival Analysis** for more precise shelf-life prediction
 3. **IoT Integration** — real-time cold-chain sensor data
