@@ -12,6 +12,13 @@
 ![Plotly](https://img.shields.io/badge/Plotly-Interactive%20Dashboard-3F4F75?style=for-the-badge&logo=plotly&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-success?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Project-Completed-blue?style=for-the-badge)
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://hyperpure-pisa.streamlit.app/)
+
+</p>
+
+<p align="center">
+
+🚀 **Live Demo:** https://hyperpure-pisa.streamlit.app/
 
 </p>
 
