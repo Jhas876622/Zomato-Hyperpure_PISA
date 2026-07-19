@@ -543,13 +543,11 @@ def tab_alerts(active_lots):
                            "% Shelf Life Left","Qty (kg)","Value (₹)",
                            "Risk Score","Risk Level","Recommended Action"]
 
-    def color_risk(val):
-        colors = {"🔴 CRITICAL":"#FFEDED","🟠 HIGH":"#FFF3E0",
-                  "🟡 MEDIUM":"#FFFDE7","🟢 LOW":"#E8F5E9"}
-        return f"background-color: {colors.get(val,'')}"
+    display_df["Days Left"] = display_df["Days Left"].astype(int)
+    display_df["Qty (kg)"] = display_df["Qty (kg)"].round(1)
 
     st.dataframe(
-        display_df.style.map(color_risk, subset=["Risk Level"]),
+        display_df,
         use_container_width=True, hide_index=True,
         column_config={
             "% Shelf Life Left": st.column_config.ProgressColumn(
