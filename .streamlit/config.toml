@@ -1,5 +1,7 @@
-# PISA "cold-room desk" theme — frosted light / cold-room navy dark.
+# PISA "cold-room desk" theme — frosted light.
 # Hyperpure red is the brand + interaction color; in charts it only ever means "critical".
+# Light only: app.py pins THEME = "light", so its HTML/CSS colours match only this palette.
+# Adding a [theme.dark] section here would put dark-mode viewers' text on a dark background.
 
 [theme]
 base = "light"
@@ -10,21 +12,12 @@ textColor = "#142029"
 borderColor = "#D3DCE2"
 baseRadius = "small"
 showSidebarBorder = true
-font = "sans serif"
+font = "sans-serif"
 
-[theme.dark]
-primaryColor = "#E5414D"
-backgroundColor = "#0E1922"
-secondaryBackgroundColor = "#172631"
-textColor = "#E4ECF1"
-borderColor = "#24384A"
-redColor = "#E5414D"
-orangeColor = "#EE8A3A"
-yellowColor = "#D9B444"
-greenColor = "#4DA67E"
-blueColor = "#5DB0CF"
-chartCategoricalColors = ["#5DB0CF", "#8EA1AE", "#E5414D", "#EE8A3A", "#4DA67E", "#D9B444"]
+[client]
+# Visitors see a generic error, not stack traces with file paths; full details stay in the server log.
+showErrorDetails = "none"
 
-[theme.dark.sidebar]
-backgroundColor = "#0A131A"
-secondaryBackgroundColor = "#14222C"
+[server]
+enableXsrfProtection = true
+enableCORS = true

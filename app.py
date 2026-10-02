@@ -22,7 +22,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from config import SKUS, WAREHOUSES, DB_PATH, REPORTS_DIR
+from config import SKUS, WAREHOUSES, DB_PATH, REPORTS_DIR, CLAUDE_MODEL
 import ml_models
 
 # ── Auto-setup: generate data + train models if missing ──────
@@ -42,8 +42,8 @@ st.set_page_config(
 )
 
 # ── Design tokens ("cold-room desk") ──────────────────────────
-# High-contrast light mode palette by default, ensuring all text, tags and charts
-# remain crisp and perfectly readable.
+# Light only, matching .streamlit/config.toml (which defines no dark theme).
+# To support dark mode, add [theme.dark] there AND pick THEME from st.context.theme.type.
 THEME = "light"
 TOKENS = {
     "light": dict(bg="#F2F5F7", surface="#FFFFFF", surface2="#E4EAEE", ink="#142029", steel="#475569",
@@ -237,33 +237,23 @@ def load_active_lots():
     sp, _ = load_models()
     return ml_models.score_active_lots(pd.read_csv("data/active_lots.csv"), sp)
 
-def get_ist_now():
-    """Returns current Indian Standard Time (IST, UTC+5:30) as a tz-naive Timestamp."""
-    try:
-        from zoneinfo import ZoneInfo
-        return pd.Timestamp.now(ZoneInfo("Asia/Kolkata")).tz_localize(None)
-    except Exception:
-        import datetime
-        return pd.Timestamp.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).tz_localize(None)
+from data_generator import get_ist_now  # IST (UTC+5:30), tz-naive
+
+SENSOR_REFRESH_HOURS = 2
+
 
 @st.cache_data(ttl=900)
 def load_sensors():
+    """Simulated IoT feed. The simulator writes new hourly readings when the file is missing or
+    older than SENSOR_REFRESH_HOURS; stored timestamps are never shifted, so the header's
+    "read N min ago" is always the real age of the newest reading."""
+    import data_generator
     path = "data/sensor_readings.csv"
-    if not os.path.exists(path):
-        import data_generator
-        data_generator.generate_sensor_readings()
-    df = pd.read_csv(path, parse_dates=["reading_ts"])
-    now_ist = get_ist_now()
-    if df.empty or "reading_ts" not in df.columns:
-        import data_generator
+    df = pd.read_csv(path, parse_dates=["reading_ts"]) if os.path.exists(path) else pd.DataFrame()
+    stale = df.empty or (get_ist_now() - df["reading_ts"].max()) > pd.Timedelta(hours=SENSOR_REFRESH_HOURS)
+    if stale:
         df = data_generator.generate_sensor_readings()
         df["reading_ts"] = pd.to_datetime(df["reading_ts"])
-    else:
-        # Dynamically align reading timestamps to current IST so freshness is always live
-        delta = (now_ist - df["reading_ts"].max()).total_seconds()
-        if delta > 7200 or delta < 0:
-            offset = now_ist.floor("h") - df["reading_ts"].max().floor("h")
-            df["reading_ts"] = df["reading_ts"] + offset
     return df
 
 def load_drift_report():
@@ -273,24 +263,42 @@ def load_drift_report():
     with open(path) as f:
         return json.load(f)
 
-def get_llm_key():
-    try:
-        if "user_llm_key" in st.session_state and st.session_state["user_llm_key"]:
-            return st.session_state["user_llm_key"].strip()
-    except Exception:
-        pass
-    for k in ["GROQ_API_KEY", "ANTHROPIC_API_KEY"]:
-        v = os.getenv(k)
-        if v:
-            return v
-        try:
-            if hasattr(st, "secrets") and k in st.secrets:
-                return st.secrets[k]
-        except Exception:
-            pass
+KEY_PREFIXES = ("gsk_", "sk-ant-")
+
+# The public app spends the owner's LLM key, so cap usage per visitor and in total.
+MAX_QUESTION_CHARS  = 500
+SESSION_LLM_PER_HOUR = 20
+GLOBAL_LLM_PER_HOUR  = 300
+
+
+@st.cache_resource
+def _global_llm_calls():
+    # ponytail: per-process deque; a multi-replica deployment needs a shared store
+    from collections import deque
+    return deque()
+
+
+def llm_rate_limited():
+    """Records one LLM call and returns a message if this visitor or the whole app is over its hourly cap."""
+    import time
+    now = time.time()
+    session_calls = [t for t in st.session_state.get("llm_calls", []) if now - t < 3600]
+    global_calls = _global_llm_calls()
+    while global_calls and now - global_calls[0] > 3600:
+        global_calls.popleft()
+    if len(session_calls) >= SESSION_LLM_PER_HOUR:
+        return f"You've asked {SESSION_LLM_PER_HOUR} questions in the last hour. Please try again later."
+    if len(global_calls) >= GLOBAL_LLM_PER_HOUR:
+        return "Ask PISA is busy right now (hourly limit reached for this demo). Please try again later."
+    st.session_state["llm_calls"] = session_calls + [now]
+    global_calls.append(now)
     return None
 
-get_anthropic_key = get_llm_key
+
+def get_llm_key():
+    """Key typed in this session wins; otherwise env vars, then Streamlit secrets (see analyst.resolve_key)."""
+    from analyst import resolve_key
+    return resolve_key(st.session_state.get("user_llm_key"))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -307,7 +315,7 @@ def render_header(sensors):
         f'  <div><div class="mast-mark">PISA</div>'
         f'       <div class="mast-name">Hyperpure cold-chain desk</div>'
         f'       <div class="mast-sub">Predictive inventory and spoilage alerts for the {cities} hubs</div></div>'
-        f'  <div class="mast-meta"><b>{now:%A}, {now.day} {now:%B}</b><br>Cold-room sensors read {fresh}</div>'
+        f'  <div class="mast-meta"><b>{now:%A}, {now.day} {now:%B}</b><br>Simulated cold-room sensors read {fresh}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -939,27 +947,30 @@ def tab_model_health(sp_artifact, dm_artifact, lot_df):
 
 
 @st.cache_data(ttl=300)
-def get_morning_briefing_stats():
+def top_spoiling_vendor():
+    """(vendor_name, spoil_rate_pct), or None if the warehouse can't be queried."""
+    import duckdb
     import warehouse_db
     try:
-        critical_df = warehouse_db.query("SELECT COUNT(*) as cnt, COALESCE(SUM(lot_value_inr), 0) as val FROM fact_active_lots WHERE spoil_prob_48h > 50")
-        crit_count = int(critical_df["cnt"].iloc[0])
-        crit_val = float(critical_df["val"].iloc[0])
-        vendor_df = warehouse_db.query("SELECT vendor_name, spoil_rate_pct FROM mart_vendor_scorecard ORDER BY spoil_rate_pct DESC LIMIT 1")
-        top_vendor = vendor_df["vendor_name"].iloc[0] if len(vendor_df) else "GreenLeaf Mandi Co."
-        top_vendor_spoil = float(vendor_df["spoil_rate_pct"].iloc[0]) if len(vendor_df) else 59.7
-        return {
-            "crit_count": crit_count, "crit_val": crit_val,
-            "top_vendor": top_vendor, "top_vendor_spoil": top_vendor_spoil
-        }
-    except Exception:
-        return {"crit_count": 14, "crit_val": 192322.0, "top_vendor": "GreenLeaf Mandi Co.", "top_vendor_spoil": 59.7}
+        df = warehouse_db.query("SELECT vendor_name, spoil_rate_pct FROM mart_vendor_scorecard "
+                                "ORDER BY spoil_rate_pct DESC LIMIT 1")
+    except duckdb.Error as e:
+        print(f"Vendor scorecard query failed: {e}")
+        return None
+    return (df["vendor_name"].iloc[0], float(df["spoil_rate_pct"].iloc[0])) if len(df) else None
+
+
+def get_morning_briefing_stats(active_lots):
+    """Uses the same urgency rule as the Overview headline (>= 50% chance of spoiling in 48h)."""
+    urgent = active_lots[active_lots["spoil_prob_48h"] >= 50]
+    return {"crit_count": len(urgent), "crit_val": float(urgent["lot_value_inr"].sum()),
+            "vendor": top_spoiling_vendor()}
 
 
 # ─────────────────────────────────────────────────────────────
 # TAB 6: ASK PISA (AI Copilot & Operations Analyst)
 # ─────────────────────────────────────────────────────────────
-def tab_ask():
+def tab_ask(active_lots):
     tab_intro("Ask PISA", "Ask questions in English or Hinglish. The AI analyst writes DuckDB SQL against "
               "live warehouse marts, computes exact figures, and drafts operational actions.")
 
@@ -967,17 +978,29 @@ def tab_ask():
     if not key:
         st.info("🔑 **Groq API Key required on deployed app**")
         st.caption("API keys are kept secure and not stored on GitHub. Enter your Groq API key below to start chatting, or configure `GROQ_API_KEY` permanently in Streamlit Cloud's App Settings → Secrets.")
+        if st.session_state.pop("key_rejected", None):
+            st.error(st.session_state.pop("key_error", "That key was rejected. Please enter a valid one."))
         user_input = st.text_input("Groq API Key (starts with gsk_):", type="password", placeholder="gsk_...")
         if user_input:
-            st.session_state["user_llm_key"] = user_input.strip()
-            st.rerun()
+            if user_input.strip().startswith(KEY_PREFIXES):
+                st.session_state["user_llm_key"] = user_input.strip()
+                st.rerun()
+            st.error("That doesn't look like an API key. Groq keys start with gsk_ and Anthropic keys with sk-ant-.")
         return
 
-    engine_name = "⚡ Groq (Fast Inference)" if key.startswith("gsk_") else "Claude 3.5 Analyst"
-    st.caption(f"Powered by **{engine_name}** with direct read-only SQL tool access to `data/pisa.duckdb`.")
+    engine_name = "⚡ Groq (Fast Inference)" if key.startswith("gsk_") else f"Claude ({CLAUDE_MODEL})"
+    cap_col, btn_col = st.columns([5, 1])
+    cap_col.caption(f"Powered by **{engine_name}** with direct read-only SQL tool access to `data/pisa.duckdb`.")
+    if st.session_state.get("user_llm_key") and btn_col.button("Change API key", width="stretch"):
+        del st.session_state["user_llm_key"]
+        st.rerun()
 
     # ── Daily Morning Executive Briefing ──
-    briefing = get_morning_briefing_stats()
+    briefing = get_morning_briefing_stats(active_lots)
+    vendor = briefing["vendor"]
+    vendor_html = (f'<b style="color: var(--pisa-ink); font-size: 1.15rem;">{html.escape(vendor[0])}</b> '
+                   f'({vendor[1]:.1f}% spoil rate).' if vendor
+                   else '<b style="color: var(--pisa-ink);">Vendor data unavailable.</b> Run <code>python pipeline.py</code>.')
     st.markdown(f"""
     <div style="background: var(--pisa-surface); border: 1px solid var(--pisa-rule); border-left: 4px solid var(--pisa-red); border-radius: 6px; padding: 0.95rem 1.25rem; margin: 0.5rem 0 1rem;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
@@ -991,7 +1014,7 @@ def tab_ask():
             </div>
             <div>
                 <span style="color: var(--pisa-steel); font-size: 0.83rem;">⚠️ Highest Spoilage Vendor:</span><br>
-                <b style="color: var(--pisa-ink); font-size: 1.15rem;">{briefing['top_vendor']}</b> ({briefing['top_vendor_spoil']:.1f}% spoil rate).
+                {vendor_html}
             </div>
             <div>
                 <span style="color: var(--pisa-steel); font-size: 0.83rem;">🎯 Recommended Action:</span><br>
@@ -1009,13 +1032,13 @@ def tab_ask():
     q3 = c3.button("🚚 Vendor Quality Scorecard", width="stretch", help="Compare all vendors by spoilage and reject rate")
     q4 = c4.button("📈 Category Wastage Trends", width="stretch", help="Monthly wastage analysis")
 
-    action_map = {
-        q1: "Draft a WhatsApp operational alert message for the Delhi, Mumbai, and Bangalore warehouse managers detailing the critical lots expiring in 48 hours and recommended discount actions.",
-        q2: "Show all lots expiring within 48 hours that need immediate dispatch or 25% discount, with SKU, quantity, warehouse, and value in a clean table.",
-        q3: "Which vendors have the highest spoilage rates and quality reject rates? Give a comparative ranking table.",
-        q4: "How did wastage percentage change month by month across categories? Cite key numbers."
-    }
-    clicked = next((v for k, v in action_map.items() if k), None)
+    actions = [
+        (q1, "Draft a WhatsApp operational alert message for the Delhi, Mumbai, and Bangalore warehouse managers detailing the critical lots expiring in 48 hours and recommended discount actions."),
+        (q2, "Show all lots expiring within 48 hours that need immediate dispatch or 25% discount, with SKU, quantity, warehouse, and value in a clean table."),
+        (q3, "Which vendors have the highest spoilage rates and quality reject rates? Give a comparative ranking table."),
+        (q4, "How did wastage percentage change month by month across categories? Cite key numbers."),
+    ]
+    clicked = next((prompt for pressed, prompt in actions if pressed), None)
 
     history = st.session_state.setdefault("ask_history", [])
     if history and st.button("🗑️ Clear Conversation", type="secondary"):
@@ -1026,18 +1049,27 @@ def tab_ask():
         with st.chat_message(turn["role"]):
             st.markdown(turn["content"])
 
-    question = st.chat_input("Ask in English ya Hinglish (e.g. 'Delhi hub me kitna maal kharab hone wala hai?')") or clicked
+    question = st.chat_input("Ask in English ya Hinglish (e.g. 'Delhi hub me kitna maal kharab hone wala hai?')",
+                             max_chars=MAX_QUESTION_CHARS) or clicked
     if not question:
+        return
+    blocked = llm_rate_limited()
+    if blocked:
+        st.warning(blocked)
         return
     with st.chat_message("user"):
         st.markdown(question)
     with st.chat_message("assistant"):
-        from analyst import ask
+        from analyst import LLMError, ask
         with st.spinner("Querying warehouse DuckDB..."):
             try:
                 answer, sqls = ask(question, history=history, api_key=key)
-            except Exception as e:
-                st.error(f"Analyst error: {e}")
+            except LLMError as e:
+                if e.auth and st.session_state.get("user_llm_key"):
+                    del st.session_state["user_llm_key"]  # let the user enter a new key
+                    st.session_state["key_rejected"], st.session_state["key_error"] = True, str(e)
+                    st.rerun()
+                st.error(str(e))
                 return
         st.markdown(answer)
         if sqls:
@@ -1131,7 +1163,7 @@ def main():
     with tab3: tab_alerts(active_lots_f, sensors)
     with tab4: tab_inventory(lot_df_f, demand_df_f)
     with tab5: tab_model_health(sp_artifact, dm_artifact, lot_df_f)
-    with tab6: tab_ask()
+    with tab6: tab_ask(active_lots_f)
 
 
 if __name__ == "__main__":

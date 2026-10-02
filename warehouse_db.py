@@ -5,7 +5,9 @@
 # Dims  : dim_sku, dim_warehouse, dim_vendor, dim_date
 # Marts : mart_* views (the "transform" layer, dbt-style SQL models)
 #
-# Rebuilt from the CSVs by the nightly pipeline: python warehouse_db.py
+# Normally rebuilt by pipeline.py, after it has risk-scored the active lots.
+# `python warehouse_db.py` rebuilds from the current CSVs as-is (unscored if
+# data_generator.py was run on its own).
 # =============================================================
 
 import os
@@ -110,8 +112,15 @@ def build_warehouse(db_path=DB_PATH, data_dir=DATA_DIR):
 
 
 def connect_readonly(db_path=DB_PATH):
-    """Read-only connection with no filesystem/network access — safe for ad-hoc and LLM-written SQL."""
-    return duckdb.connect(db_path, read_only=True, config={"enable_external_access": False})
+    """Read-only connection with no filesystem/network access — safe for ad-hoc and LLM-written SQL.
+    Memory/thread caps stop a runaway query (e.g. a huge cross join) from taking the app down, and
+    lock_configuration stops the SQL itself from SET-ting any of these back."""
+    return duckdb.connect(db_path, read_only=True, config={
+        "enable_external_access": False,
+        "memory_limit": "512MB",
+        "threads": 2,
+        "lock_configuration": True,
+    })
 
 
 def query(sql, db_path=DB_PATH, max_rows=200):

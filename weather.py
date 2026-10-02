@@ -7,7 +7,7 @@
 # =============================================================
 
 import os
-from datetime import date
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 import numpy as np
@@ -43,7 +43,8 @@ def _fetch_daily_means(city, today_iso):
 
 def get_temp_forecast(city, dates):
     """Returns {date: (temp_c, source)} for each date — 'api' or 'seasonal'."""
-    live = _fetch_daily_means(city, date.today().isoformat()) if city else {}
+    today_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()  # cache key: one fetch per IST day
+    live = _fetch_daily_means(city, today_ist.isoformat()) if city else {}
     out = {}
     for d in dates:
         iso = d.strftime("%Y-%m-%d")

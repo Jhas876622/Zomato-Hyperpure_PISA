@@ -1,32 +1,52 @@
-version: '3.8'
+# docker compose up --build
+#   Dashboard  http://localhost:8501
+#   API docs   http://localhost:8000/docs
+# Keys are read from your shell or a .env file next to this file:
+#   GROQ_API_KEY / ANTHROPIC_API_KEY, OPENWEATHER_API_KEY, PISA_API_KEY
+#
+# Named volumes (not ./data bind mounts): on first run Docker seeds them with the
+# data and models baked into the image, and both services share them.
 
 services:
   dashboard:
     build: .
+    image: pisa:latest
     container_name: pisa-dashboard
     restart: unless-stopped
     ports:
       - "8501:8501"
     environment:
-      - PYTHONIOENCODING=utf-8
       - GROQ_API_KEY=${GROQ_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-}
     volumes:
-      - ./data:/app/data
-      - ./models:/app/models
+      - pisa-data:/app/data
+      - pisa-models:/app/models
     command: ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
 
   api:
-    build: .
+    image: pisa:latest
     container_name: pisa-api
     restart: unless-stopped
+    depends_on:
+      - dashboard   # reuses the image the dashboard service builds
     ports:
       - "8000:8000"
     environment:
-      - PYTHONIOENCODING=utf-8
       - PISA_API_KEY=${PISA_API_KEY:-}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-}
+      - PORT=8000
     volumes:
-      - ./data:/app/data
-      - ./models:/app/models
+      - pisa-data:/app/data
+      - pisa-models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
     command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  pisa-data:
+  pisa-models:

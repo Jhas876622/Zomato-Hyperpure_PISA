@@ -1,4 +1,5 @@
 # Fast unit tests — no trained models, network or API key needed.  Run: pytest -q
+import copy
 import json
 import os
 import sys
@@ -126,3 +127,135 @@ def test_analyst_runs_sql_tool_then_answers(monkeypatch):
     assert requests_seen[0]["fallbacks"] == "default"
     tool_result = requests_seen[1]["messages"][-1]["content"][0]
     assert tool_result["type"] == "tool_result" and "V10" in str(tool_result["content"])
+
+
+# ── Analyst bot: Groq path + provider selection (no network) ──
+class _FakeResp:
+    def __init__(self, body, status=200):
+        self._body, self.status_code, self.ok = body, status, status < 400
+        self.text = json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+def _groq_fake(monkeypatch, replies):
+    """Patch requests.post in analyst to return `replies` in order; returns the list of sent payloads."""
+    import analyst
+    sent, queue = [], list(replies)
+    monkeypatch.setattr(analyst, "describe_schema", lambda db_path: "dim_vendor(vendor_id VARCHAR)")
+    monkeypatch.setattr(analyst, "query", lambda sql, max_rows: pd.DataFrame({"vendor_id": ["V10"]}))
+    monkeypatch.setattr(analyst.requests, "post",
+                        lambda url, headers, json, timeout: (sent.append({"headers": headers, "json": copy.deepcopy(json)}),
+                                                             queue.pop(0) if len(queue) > 1 else queue[0])[1])
+    return sent
+
+
+def _tool_call_reply(call_id="c1", sql="SELECT vendor_id FROM dim_vendor"):
+    return _FakeResp({"choices": [{"finish_reason": "tool_calls", "message": {
+        "role": "assistant", "content": None, "reasoning": "internal",
+        "tool_calls": [{"id": call_id, "type": "function",
+                        "function": {"name": "run_sql", "arguments": json.dumps({"sql": sql})}}]}}]})
+
+
+def _answer_reply(content):
+    return _FakeResp({"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content}}]})
+
+
+@pytest.fixture(autouse=True)
+def _no_llm_keys(monkeypatch):
+    # Tests must not depend on keys set on the dev machine or in CI
+    for k in ("GROQ_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_groq_runs_tool_then_answers(monkeypatch):
+    import analyst
+    sent = _groq_fake(monkeypatch, [_tool_call_reply(), _answer_reply("V10 spoils most.")])
+
+    answer, sqls = analyst.ask("Worst vendor?", api_key="gsk_test")
+
+    assert answer == "V10 spoils most."
+    assert sqls == ["SELECT vendor_id FROM dim_vendor"]
+    assert sent[0]["headers"]["Authorization"] == "Bearer gsk_test"
+    second = sent[1]["json"]["messages"]
+    assert "reasoning" not in second[-2]                     # only standard fields sent back
+    assert second[-1]["role"] == "tool" and second[-1]["tool_call_id"] == "c1" and "V10" in second[-1]["content"]
+
+
+def test_groq_null_content_and_round_limit(monkeypatch):
+    import analyst
+    _groq_fake(monkeypatch, [_answer_reply(None)])
+    assert analyst.ask("q", api_key="gsk_test")[0] == "I couldn't find an answer in the data."
+
+    sent = _groq_fake(monkeypatch, [_tool_call_reply()])     # model never stops calling tools
+    answer, sqls = analyst.ask("q", api_key="gsk_test")
+    assert len(sent) == analyst.MAX_TOOL_ROUNDS
+    assert "couldn't finish" in answer and "V10" not in answer   # never the raw CSV
+
+
+def test_groq_rejected_key_is_an_auth_error(monkeypatch):
+    import analyst
+    _groq_fake(monkeypatch, [_FakeResp({"error": {"message": "Invalid API Key"}}, status=401)])
+    with pytest.raises(analyst.LLMError) as e:
+        analyst.ask("q", api_key="gsk_bad")
+    assert e.value.auth
+
+
+@pytest.mark.parametrize("key, engine", [("gsk_x", "groq"), ("sk-ant-x", "claude")])
+def test_ask_routes_by_key_prefix(monkeypatch, key, engine):
+    import analyst
+    monkeypatch.setattr(analyst, "_ask_groq", lambda *a, **kw: ("groq", []))
+    monkeypatch.setattr(analyst, "_ask_claude", lambda *a, **kw: ("claude", []))
+    assert analyst.ask("q", api_key=key)[0] == engine
+
+
+def test_ask_rejects_missing_or_unknown_key(monkeypatch):
+    import analyst
+    monkeypatch.setattr(analyst, "resolve_key", lambda api_key=None: api_key)
+    for key in (None, "not-a-key"):
+        with pytest.raises(analyst.LLMError):
+            analyst.ask("q", api_key=key)
+
+
+# ── Security controls ────────────────────────────────────────
+def test_readonly_sql_cannot_unlock_its_own_limits(tiny_db):
+    for sql in ("SET memory_limit='8GB'", "SET enable_external_access=true", "ATTACH 'x.db'", "INSTALL httpfs"):
+        with pytest.raises(duckdb.Error):
+            warehouse_db.query(sql, tiny_db)
+
+
+@pytest.fixture
+def api_client():
+    from fastapi.testclient import TestClient
+    import api
+    api._hits.clear()
+    return TestClient(api.app), api
+
+
+BODY = {"mean_demand_kg": 50, "std_demand_kg": 10}
+
+
+def test_api_fails_closed_in_production_without_key(monkeypatch, api_client):
+    client, _ = api_client
+    monkeypatch.delenv("PISA_API_KEY", raising=False)
+    monkeypatch.setenv("PISA_ENV", "production")
+    assert client.post("/newsvendor", json=BODY).status_code == 503
+
+
+def test_api_rejects_unknown_fields_and_sets_security_headers(monkeypatch, api_client):
+    client, _ = api_client
+    monkeypatch.delenv("PISA_ENV", raising=False)
+    r = client.post("/newsvendor", json={**BODY, "is_admin": True})
+    assert r.status_code == 422
+    r = client.post("/newsvendor", json=BODY)
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["X-Frame-Options"] == "DENY"
+
+
+def test_api_rate_limits_per_client(monkeypatch, api_client):
+    client, api = api_client
+    monkeypatch.delenv("PISA_ENV", raising=False)
+    monkeypatch.setattr(api, "RATE_LIMIT_PER_MIN", 3)
+    codes = [client.post("/newsvendor", json=BODY).status_code for _ in range(4)]
+    assert codes == [200, 200, 200, 429]

@@ -408,4 +408,5 @@ if __name__ == "__main__":
     print(f"   Date range     : {SIMULATION_START} → {SIMULATION_END}")
     print(f"   SKUs           : {len(SKUS)}")
     print(f"   Warehouses     : {len(WAREHOUSES)}")
-    print("\n✅ All data generated successfully!\n")
+    print("\n✅ All data generated successfully!")
+    print("   Next: python pipeline.py --skip-ingest  (scores lots + rebuilds the DuckDB warehouse)\n")

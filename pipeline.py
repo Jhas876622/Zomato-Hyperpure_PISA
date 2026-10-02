@@ -3,7 +3,7 @@
 #
 #   1. Ingest       → raw CSVs (synthetic WMS orders, lots, IoT sensors, vendors)
 #   2. Drift check  → reports/drift_report.json
-#   3. Train        → only if drift detected, models missing, or --force
+#   3. Train        → only if drift detected, models missing, or --force-train
 #   4. Score        → model risk scores on today's active lots
 #   5. Load         → rebuild the DuckDB star schema + marts
 #

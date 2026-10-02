@@ -2,20 +2,27 @@
 # api.py — PISA REST API (FastAPI)
 #
 # Run:  uvicorn api:app --reload        Docs: http://localhost:8000/docs
-# Auth: if PISA_API_KEY is set, every endpoint except /health requires
-#       header  X-API-Key: <key>
+# Auth: every endpoint except /health requires header  X-API-Key: <PISA_API_KEY>.
+#       Fails closed: with PISA_ENV=production (set in the Dockerfile) and no
+#       PISA_API_KEY, protected endpoints return 503 instead of running open.
+#       Locally (PISA_ENV unset) a missing key leaves the API open for development.
+# Limits: RATE_LIMIT_PER_MIN requests per client IP; standard security headers.
+# HTTPS: terminate TLS in front of this service (reverse proxy / platform).
 # =============================================================
 
 import json
 import os
 import secrets
+import time
+from collections import defaultdict, deque
 from functools import lru_cache
 from typing import Literal
 
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import ml_models
 from config import DATA_DIR, REPORTS_DIR, SKUS, WAREHOUSES
@@ -24,11 +31,43 @@ app = FastAPI(title="PISA API", version="1.0",
               description="Predictive Inventory & Spoilage Alerts — Zomato Hyperpure B2B")
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+RATE_LIMIT_PER_MIN = int(os.getenv("PISA_RATE_LIMIT_PER_MIN", "60"))
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",  # honoured only over HTTPS
+}
+
+# ponytail: in-memory, per-process limiter; use a shared store (e.g. Redis) if you run >1 worker
+_hits = defaultdict(deque)
+
+
+@app.middleware("http")
+async def rate_limit_and_headers(request: Request, call_next):
+    ip = request.client.host if request.client else "unknown"
+    now, window = time.monotonic(), _hits[ip]
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= RATE_LIMIT_PER_MIN:
+        response = JSONResponse({"detail": "Too many requests, slow down."}, status_code=429,
+                                headers={"Retry-After": "60"})
+    else:
+        window.append(now)
+        response = await call_next(request)
+    response.headers.update(SECURITY_HEADERS)
+    return response
 
 
 def require_api_key(key: str | None = Security(api_key_header)):
     expected = os.getenv("PISA_API_KEY")
-    if expected and not (key and secrets.compare_digest(key, expected)):
+    if not expected:
+        if os.getenv("PISA_ENV") == "production":
+            raise HTTPException(status_code=503, detail="API key not configured on the server")
+        return  # local development
+    if not (key and secrets.compare_digest(key, expected)):
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
 
@@ -49,8 +88,9 @@ SKU_BY_ID = {s["sku_id"]: s for s in SKUS}
 
 # ── Schemas ───────────────────────────────────────────────────
 class LotIn(BaseModel):
-    sku_id: str = Field(examples=["SKU001"])
-    warehouse_id: str = Field(examples=["WH_DEL_01"])
+    model_config = ConfigDict(extra="forbid")  # unknown fields are rejected, not silently ignored
+    sku_id: str = Field(max_length=16, examples=["SKU001"])
+    warehouse_id: str = Field(max_length=16, examples=["WH_DEL_01"])
     days_old: int = Field(ge=0, le=60)
     quantity_kg: float = Field(gt=0, le=100_000)
     temp_deviation_c: float = Field(ge=0, le=30)
@@ -66,10 +106,11 @@ class LotRisk(BaseModel):
 
 
 class NewsvendorIn(BaseModel):
-    mean_demand_kg: float = Field(ge=0)
-    std_demand_kg: float = Field(ge=0)
-    cost_understock: float = Field(default=0.25, gt=0)
-    cost_overstock: float = Field(default=1.00, gt=0)
+    model_config = ConfigDict(extra="forbid")
+    mean_demand_kg: float = Field(ge=0, le=1_000_000)
+    std_demand_kg: float = Field(ge=0, le=1_000_000)
+    cost_understock: float = Field(default=0.25, gt=0, le=100)
+    cost_overstock: float = Field(default=1.00, gt=0, le=100)
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -83,6 +124,11 @@ def health():
         raise HTTPException(status_code=503, detail="Models not trained yet — run python pipeline.py")
 
 
+ALERT_FIELDS = ["lot_id", "sku_id", "sku_name", "category", "warehouse_id", "warehouse_name",
+                "days_remaining", "quantity_kg", "lot_value_inr", "risk_score", "risk_level",
+                "spoil_prob_48h", "recommended_action"]
+
+
 @app.get("/forecast/{sku_id}/{warehouse_id}", dependencies=[Depends(require_api_key)])
 def forecast(sku_id: str, warehouse_id: str, horizon: int = Query(14, ge=1, le=30)):
     if sku_id not in SKU_IDS or warehouse_id not in WH_IDS:
@@ -91,6 +137,7 @@ def forecast(sku_id: str, warehouse_id: str, horizon: int = Query(14, ge=1, le=3
     fc = ml_models.generate_forecast(demand_df(), sku_id, warehouse_id, horizon, sku_models=dm["models"])
     if fc is None:
         raise HTTPException(status_code=404, detail="Not enough history for this SKU/warehouse")
+    fc = fc.drop(columns=["temp_source", "type"], errors="ignore")
     return {"sku_id": sku_id, "warehouse_id": warehouse_id, "forecast": fc.to_dict("records")}
 
 
@@ -118,7 +165,8 @@ def alerts(min_level: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"] = "HIGH"):
     sp, _ = artifacts()
     lots = ml_models.score_active_lots(pd.read_csv(os.path.join(DATA_DIR, "active_lots.csv")), sp)
     keep = lots[lots["risk_level"].isin(order[: order.index(min_level) + 1])]
-    return {"count": len(keep), "lots": keep.to_dict("records")}
+    fields = [c for c in ALERT_FIELDS if c in keep.columns]  # only what a client needs
+    return {"count": len(keep), "lots": keep[fields].to_dict("records")}
 
 
 @app.post("/newsvendor", dependencies=[Depends(require_api_key)])

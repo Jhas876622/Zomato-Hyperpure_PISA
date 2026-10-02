@@ -11,7 +11,8 @@
 #
 # Engine 3: Newsvendor optimal order quantity
 #
-# Every training run is tracked in MLflow (params, metrics, artifacts).
+# Training runs are tracked in MLflow when it is installed (requirements-dev.txt);
+# otherwise tracking is skipped.
 # Run standalone: python ml_models.py
 # =============================================================
 

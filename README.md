@@ -51,8 +51,8 @@ Instead of simply showing reports, PISA analyzes operational data and generates 
 | **1 · Data Sources** | WMS orders & lots, OpenWeatherMap forecasts (seasonal fallback without a key), simulated IoT cold-storage sensors (hourly temp/humidity, door-open spikes, compressor failures), vendor performance | `data_generator.py`, `weather.py` |
 | **2 · Data Engineering** | DuckDB star schema (`fact_orders`, `fact_lots`, `fact_sensor_readings`, `fact_active_lots`, `dim_sku/warehouse/vendor/date`) + SQL marts; nightly ETL | `warehouse_db.py`, `pipeline.py` |
 | **3 · ML & Intelligence** | Engine 1: XGBoost demand forecast · Engine 2: Random Forest risk + Cox survival (P(spoil in 48h)) · Engine 3: Newsvendor order quantity | `ml_models.py` |
-| **4 · MLOps** | MLflow tracking + model registry, KS/PSI drift monitoring that triggers retraining, GitHub Actions CI + nightly pipeline, Docker Compose | `drift.py`, `.github/workflows/`, `Dockerfile`, `docker-compose.yml` |
-| **5 · Product & API** | Streamlit dashboard (6 tabs), FastAPI REST service, "Ask PISA" Claude analyst bot (text-to-SQL over DuckDB) | `app.py`, `api.py`, `analyst.py` |
+| **4 · MLOps** | MLflow tracking + model registry (local, via `requirements-dev.txt`), KS/PSI drift monitoring that triggers retraining, GitHub Actions CI + nightly pipeline, Docker Compose | `drift.py`, `.github/workflows/`, `Dockerfile`, `docker-compose.yml` |
+| **5 · Product & API** | Streamlit dashboard (6 tabs), FastAPI REST service, "Ask PISA" LLM analyst: Groq by default, Claude optional (text-to-SQL over DuckDB) | `app.py`, `api.py`, `analyst.py` |
 
 ### Current model results (30-day time-based holdout)
 
@@ -69,18 +69,29 @@ pip install -r requirements-dev.txt
 python pipeline.py              # ingest → drift check → train → score lots → build DuckDB
 streamlit run app.py            # dashboard  → http://localhost:8501
 uvicorn api:app --reload        # REST API   → http://localhost:8000/docs
-mlflow ui                       # experiments → http://localhost:5000
+mlflow ui --backend-store-uri sqlite:///mlflow.db   # experiments → http://localhost:5000
 pytest -q                       # tests
 ```
 
-Or everything at once with `docker compose up --build`.
+Or run the dashboard (:8501) and REST API (:8000) with `docker compose up --build`. Put your keys in a `.env` file next to `docker-compose.yml`. The image installs only `requirements.txt`, so MLflow tracking and `mlflow ui` are local-only.
 
 | Env var | Enables |
 |---|---|
-| `GROQ_API_KEY` | "Ask PISA" AI Copilot & Operations Analyst with fast inference (default) |
-| `ANTHROPIC_API_KEY` | Alternative LLM engine (Claude 3.5 Sonnet) for "Ask PISA" |
+| `GROQ_API_KEY` | "Ask PISA" AI Copilot on Groq (`gsk_...`, model in `config.GROQ_MODEL`), the default |
+| `ANTHROPIC_API_KEY` | Alternative engine for "Ask PISA": Claude (`sk-ant-...`, model in `config.CLAUDE_MODEL`) |
 | `OPENWEATHER_API_KEY` | Live weather in forecasts (seasonal fallback without key) |
 | `PISA_API_KEY` | Requires `X-API-Key` header on the REST API |
+| `MLFLOW_TRACKING_URI` | MLflow store (default `sqlite:///mlflow.db`) |
+| `PISA_ENV` | `production` (set in the Dockerfile) makes the API refuse to run without `PISA_API_KEY` |
+
+### Security
+
+- **Secrets:** keys live only in env vars or `.streamlit/secrets.toml`, which is git-ignored and excluded from Docker images by `.dockerignore`. Nothing secret is in the code or the git history.
+- **LLM-written SQL:** runs on a read-only DuckDB connection with no file or network access, capped at 512 MB and 2 threads. The query cannot change these settings.
+- **Ask PISA:** questions are capped at 500 characters, 20 per visitor per hour and 300 per hour across the app, so a public deployment can't drain your LLM quota.
+- **REST API:** requires `X-API-Key` in production, rejects unknown fields, is rate-limited per IP (`PISA_RATE_LIMIT_PER_MIN`, default 60), returns only the fields clients need, and sends security headers.
+- **HTTPS:** the containers serve plain HTTP. Put them behind a TLS-terminating reverse proxy or a platform that provides HTTPS (Streamlit Cloud does this for you).
+- **Dependencies:** CI runs `pip-audit` on every push.
 
 **API endpoints:** `GET /health` · `GET /forecast/{sku_id}/{warehouse_id}` · `POST /spoilage/score` · `GET /alerts` · `POST /newsvendor` · `GET /monitoring/drift`
 
@@ -702,19 +713,22 @@ This enables decision-makers to quickly understand warehouse health and take cor
 
 ```text
 PISA/
-│
-├── app.py
+├── app.py                  # Streamlit dashboard (6 tabs)
+├── api.py                  # FastAPI REST service
+├── analyst.py              # "Ask PISA" LLM analyst (Groq / Claude, text-to-SQL)
+├── pipeline.py             # nightly ETL: ingest → drift → train → score → DuckDB
+├── data_generator.py       # synthetic orders, lots, IoT sensors, vendors
+├── ml_models.py            # XGBoost, Random Forest + Cox, Newsvendor
+├── warehouse_db.py         # DuckDB star schema + marts
+├── drift.py                # KS / PSI drift monitoring
+├── weather.py              # OpenWeatherMap client with seasonal fallback
 ├── config.py
-├── data_generator.py
-├── ml_models.py
-├── requirements.txt
-├── README.md
-│
-├── assets/
-│
-├── data/
-│
-└── screenshots/
+├── tests/                  # pytest suite
+├── .github/workflows/      # CI + nightly pipeline
+├── .streamlit/config.toml  # theme
+├── Dockerfile, docker-compose.yml
+├── requirements.txt, requirements-dev.txt
+└── data/, models/, reports/   # generated by pipeline.py (git-ignored)
 ```
 
 ---
@@ -840,7 +854,7 @@ The project follows a modular architecture because each component has a single r
 - Independent model development
 - Cleaner project structure
 
-For example, the demand forecasting model can be replaced with an LSTM or XGBoost model in the future without affecting the dashboard or spoilage prediction pipeline.
+For example, the demand forecasting model can be replaced with an LSTM or a transformer model in the future without affecting the dashboard or spoilage prediction pipeline.
 
 Similarly, new inventory optimization techniques can be integrated without modifying the forecasting models.
 
@@ -1102,7 +1116,7 @@ git clone https://github.com/Jhas876622/Zomato-Hyperpure_PISA.git
 Move into the project directory.
 
 ```bash
-cd "Zomato B2B (hyperpure_pisa)"
+cd Zomato-Hyperpure_PISA
 ```
 
 ---
@@ -1335,7 +1349,7 @@ Deployment only requires:
 - requirements.txt
 - Python environment
 
-No additional configuration is necessary.
+Optional: set `GROQ_API_KEY` (or `ANTHROPIC_API_KEY`) and `OPENWEATHER_API_KEY` as secrets to enable the Ask PISA copilot and live weather.
 
 ---
 

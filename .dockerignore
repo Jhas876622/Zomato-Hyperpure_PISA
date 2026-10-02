@@ -1,0 +1,23 @@
+# Secrets — never bake keys into an image; pass them via docker-compose environment
+.streamlit/secrets.toml
+.env
+
+# Local state the image builds for itself
+data/
+models/
+reports/
+mlflow.db
+mlartifacts/
+mlruns/
+
+# Tooling / VCS
+.git
+.github
+.devcontainer
+.claude
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+scratch/

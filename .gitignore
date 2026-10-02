@@ -22,3 +22,7 @@ mlruns/
 .env
 .pytest_cache/
 .claude/
+scratch/
+.DS_Store
+Thumbs.db
+
