@@ -77,8 +77,9 @@ Or everything at once with `docker compose up --build`.
 
 | Env var | Enables |
 |---|---|
-| `ANTHROPIC_API_KEY` | "Ask PISA" analyst bot (dashboard tab 6, `python analyst.py "question"`) |
-| `OPENWEATHER_API_KEY` | Live weather in forecasts |
+| `GROQ_API_KEY` | "Ask PISA" AI Copilot & Operations Analyst with fast inference (default) |
+| `ANTHROPIC_API_KEY` | Alternative LLM engine (Claude 3.5 Sonnet) for "Ask PISA" |
+| `OPENWEATHER_API_KEY` | Live weather in forecasts (seasonal fallback without key) |
 | `PISA_API_KEY` | Requires `X-API-Key` header on the REST API |
 
 **API endpoints:** `GET /health` · `GET /forecast/{sku_id}/{warehouse_id}` · `POST /spoilage/score` · `GET /alerts` · `POST /newsvendor` · `GET /monitoring/drift`
@@ -1095,13 +1096,13 @@ git --version
 ## 1️⃣ Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/PISA.git
+git clone https://github.com/Jhas876622/Zomato-Hyperpure_PISA.git
 ```
 
 Move into the project directory.
 
 ```bash
-cd PISA
+cd "Zomato B2B (hyperpure_pisa)"
 ```
 
 ---
