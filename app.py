@@ -237,17 +237,33 @@ def load_active_lots():
     sp, _ = load_models()
     return ml_models.score_active_lots(pd.read_csv("data/active_lots.csv"), sp)
 
-@st.cache_data(ttl=1800)
+def get_ist_now():
+    """Returns current Indian Standard Time (IST, UTC+5:30) as a tz-naive Timestamp."""
+    try:
+        from zoneinfo import ZoneInfo
+        return pd.Timestamp.now(ZoneInfo("Asia/Kolkata")).tz_localize(None)
+    except Exception:
+        import datetime
+        return pd.Timestamp.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).tz_localize(None)
+
+@st.cache_data(ttl=900)
 def load_sensors():
     path = "data/sensor_readings.csv"
     if not os.path.exists(path):
         import data_generator
         data_generator.generate_sensor_readings()
     df = pd.read_csv(path, parse_dates=["reading_ts"])
-    if (pd.Timestamp.now() - df["reading_ts"].max()).total_seconds() > 43200:
+    now_ist = get_ist_now()
+    if df.empty or "reading_ts" not in df.columns:
         import data_generator
         df = data_generator.generate_sensor_readings()
         df["reading_ts"] = pd.to_datetime(df["reading_ts"])
+    else:
+        # Dynamically align reading timestamps to current IST so freshness is always live
+        delta = (now_ist - df["reading_ts"].max()).total_seconds()
+        if delta > 7200 or delta < 0:
+            offset = now_ist.floor("h") - df["reading_ts"].max().floor("h")
+            df["reading_ts"] = df["reading_ts"] + offset
     return df
 
 def load_drift_report():
@@ -281,7 +297,7 @@ get_anthropic_key = get_llm_key
 # HEADER
 # ─────────────────────────────────────────────────────────────
 def render_header(sensors):
-    now  = pd.Timestamp.now()
+    now  = get_ist_now()
     mins = max(0, int((now - sensors["reading_ts"].max()).total_seconds() // 60))
     fresh = (f"{mins} min ago" if mins < 120 else f"{mins // 60} hours ago" if mins < 2880
              else f"{mins // 1440} days ago")

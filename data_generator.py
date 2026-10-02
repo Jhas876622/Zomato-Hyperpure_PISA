@@ -270,9 +270,18 @@ def storage_zone(sku):
     return "CHILLER" if sku["ideal_temp_c"] <= CHILLER_MAX_IDEAL_C else "COOL_ROOM"
 
 
+def get_ist_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return pd.Timestamp.now(ZoneInfo("Asia/Kolkata")).tz_localize(None)
+    except Exception:
+        import datetime
+        return pd.Timestamp.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).tz_localize(None)
+
+
 def generate_sensor_readings():
     print("🌡️  Generating IoT sensor readings...")
-    end   = pd.Timestamp.now().floor("h")
+    end   = get_ist_now().floor("h")
     hours = pd.date_range(end=end, periods=SENSOR_HISTORY_DAYS * 24, freq="h")
     records = []
 
@@ -328,7 +337,7 @@ def generate_active_lots(sensor_df=None):
     zone_temp = recent.groupby(["warehouse_id", "zone"])["temp_c"].mean().to_dict()
 
     records = []
-    today   = datetime.now().date()
+    today   = get_ist_now().date()
 
     for i, sku in enumerate(SKUS):
         shelf_life = sku["shelf_life_days"]
