@@ -65,7 +65,7 @@ Instead of simply showing reports, PISA analyzes operational data and generates 
 ### Run it
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 python pipeline.py              # ingest → drift check → train → score lots → build DuckDB
 streamlit run app.py            # dashboard  → http://localhost:8501
 uvicorn api:app --reload        # REST API   → http://localhost:8000/docs
