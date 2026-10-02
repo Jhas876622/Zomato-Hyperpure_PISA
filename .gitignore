@@ -12,4 +12,13 @@ env/
 # Project specific
 data/*.csv
 models/*.pkl
-.streamlit/
+.streamlit/secrets.toml
+data/*.duckdb
+data/*.tmp
+reports/
+mlflow.db
+mlartifacts/
+mlruns/
+.env
+.pytest_cache/
+.claude/

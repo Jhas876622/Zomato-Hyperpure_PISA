@@ -11,7 +11,8 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
-from config import SKUS, FESTIVALS, WAREHOUSES, SIMULATION_START, SIMULATION_END, RANDOM_SEED
+from config import (SKUS, FESTIVALS, WAREHOUSES, VENDORS, STORAGE_ZONES, CHILLER_MAX_IDEAL_C,
+                    SENSOR_HISTORY_DAYS, SIMULATION_START, SIMULATION_END, RANDOM_SEED)
 
 np.random.seed(RANDOM_SEED)
 
@@ -140,7 +141,10 @@ def generate_lot_data():
 
             proc_dates = date_range[::procurement_interval]
 
+            sku_vendors = [v for v in VENDORS if v["category"] == sku["category"]]
+
             for proc_date in proc_dates:
+                vendor = sku_vendors[np.random.randint(len(sku_vendors))]
                 # Quantity procured: 2–4 days of base demand (slight over-ordering pattern)
                 over_order_factor = np.random.uniform(1.1, 1.6)  # realistic over-ordering
                 quantity_kg = round(
@@ -189,12 +193,21 @@ def generate_lot_data():
                     + (temp_deviation / 6.0) * 1.8   # temp deviation amplifies risk
                     + (over_order_factor - 1) * 0.6   # over-ordering adds mild risk
                     + base_spoil_prob * 1.5            # category baseline
+                    + vendor["quality_reject_rate"] * 4.0  # poor inbound quality spoils faster
                 )
                 # Sigmoid transform: maps interaction_score → probability
                 spoil_prob = 1.0 / (1.0 + np.exp(-(interaction_score - 2.0) * 2.5))
                 spoil_prob = np.clip(spoil_prob, 0.02, 0.95)
 
                 did_spoil = int(np.random.random() < spoil_prob)
+
+                # Survival target: day the lot spoiled, or censored at end of
+                # shelf life (dispatched without spoiling). Temp abuse shortens it.
+                if did_spoil:
+                    days_to_event = int(np.clip(round(effective_shelf_life * np.random.uniform(0.4, 1.0)
+                                                      - temp_deviation * 0.3), 1, effective_shelf_life))
+                else:
+                    days_to_event = effective_shelf_life
 
                 # If spoiled, how much % was spoiled?
                 spoilage_pct = round(np.random.uniform(0.15, 0.80), 2) if did_spoil else 0.0
@@ -217,6 +230,8 @@ def generate_lot_data():
                     "category":         sku["category"],
                     "warehouse_id":     wh["id"],
                     "warehouse_name":   wh["name"],
+                    "vendor_id":        vendor["vendor_id"],
+                    "vendor_reject_rate": vendor["quality_reject_rate"],
                     "procurement_date": proc_date.strftime("%Y-%m-%d"),
                     "expiry_date":      expiry_date.strftime("%Y-%m-%d"),
                     "shelf_life_days":  shelf_life,
@@ -229,6 +244,7 @@ def generate_lot_data():
                     "price_per_kg":     sku["price_per_kg"],
                     "lot_value":        round(quantity_kg * sku["price_per_kg"], 2),
                     "did_spoil":        did_spoil,
+                    "days_to_event":    days_to_event,
                     "spoilage_pct":     spoilage_pct,
                     "spoiled_kg":       spoiled_kg,
                     "spoiled_value":    spoiled_value,
@@ -246,89 +262,135 @@ def generate_lot_data():
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. GENERATE ACTIVE LOTS (for live dashboard demo)
-#    These are "current" lots in the warehouse right now
-#    with varying risk levels for the alert system
+# 3. SIMULATED IoT COLD-STORAGE SENSORS
+#    Hourly temp/humidity per warehouse × zone for the last N days.
+#    Includes door-open spikes and occasional compressor-failure episodes.
 # ─────────────────────────────────────────────────────────────
-def generate_active_lots():
-    print("🚨 Generating active lots for live alerts...")
+def storage_zone(sku):
+    return "CHILLER" if sku["ideal_temp_c"] <= CHILLER_MAX_IDEAL_C else "COOL_ROOM"
 
-    records  = []
-    today    = datetime.now().date()
 
-    actions = {
-        "CRITICAL": "🔴 Redistribute or discount immediately (< 12h)",
-        "HIGH":     "🟠 Offer 25% discount to bulk buyers today",
-        "MEDIUM":   "🟡 Prioritise dispatch in next shipment",
-        "LOW":      "🟢 Monitor — on track for normal dispatch",
-    }
+def generate_sensor_readings():
+    print("🌡️  Generating IoT sensor readings...")
+    end   = pd.Timestamp.now().floor("h")
+    hours = pd.date_range(end=end, periods=SENSOR_HISTORY_DAYS * 24, freq="h")
+    records = []
+
+    for wh in WAREHOUSES:
+        for zone, spec in STORAGE_ZONES.items():
+            temp = spec["setpoint_c"] + np.random.normal(0, 0.4, len(hours))
+            # Door-open spikes during dispatch hours (5–9 AM)
+            temp += np.where(np.isin(hours.hour, [5, 6, 7, 8]), np.random.uniform(0.5, 2.0, len(hours)), 0)
+            # ~1 in 3 zones has a compressor failure episode of 4–12 hours
+            if np.random.random() < 0.33:
+                start = np.random.randint(0, len(hours) - 12)
+                temp[start:start + np.random.randint(4, 13)] += np.random.uniform(4, 8)
+            humidity = np.clip(spec["humidity_pct"] + np.random.normal(0, 3, len(hours)), 50, 100)
+
+            for ts, t, h in zip(hours, temp, humidity):
+                records.append({
+                    "reading_ts":   ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    "warehouse_id": wh["id"],
+                    "zone":         zone,
+                    "sensor_id":    f"{wh['id']}_{zone}",
+                    "temp_c":       round(float(t), 2),
+                    "humidity_pct": round(float(h), 1),
+                })
+
+    df = pd.DataFrame(records)
+    df.to_csv("data/sensor_readings.csv", index=False)
+    print(f"   ✅ Sensor readings: {len(df):,} rows saved → data/sensor_readings.csv")
+    return df
+
+
+def generate_vendor_data():
+    df = pd.DataFrame(VENDORS)
+    df.to_csv("data/vendors.csv", index=False)
+    print(f"   ✅ Vendors: {len(df)} rows saved → data/vendors.csv")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. GENERATE ACTIVE LOTS (current warehouse stock)
+#    Carries the same features the spoilage model was trained on.
+#    Temperature deviation comes from the last 24h of sensor data,
+#    and the risk score is assigned by the model (ml_models.score_active_lots).
+# ─────────────────────────────────────────────────────────────
+def generate_active_lots(sensor_df=None):
+    print("🚨 Generating active lots...")
+    if sensor_df is None:
+        sensor_df = pd.read_csv("data/sensor_readings.csv")
+
+    # Mean zone temperature over the last 24h
+    sensor_df = sensor_df.copy()
+    sensor_df["reading_ts"] = pd.to_datetime(sensor_df["reading_ts"])
+    recent = sensor_df[sensor_df["reading_ts"] > sensor_df["reading_ts"].max() - pd.Timedelta(hours=24)]
+    zone_temp = recent.groupby(["warehouse_id", "zone"])["temp_c"].mean().to_dict()
+
+    records = []
+    today   = datetime.now().date()
 
     for i, sku in enumerate(SKUS):
         shelf_life = sku["shelf_life_days"]
         wh = WAREHOUSES[i % len(WAREHOUSES)]
+        sku_vendors = [v for v in VENDORS if v["category"] == sku["category"]]
+        zone = storage_zone(sku)
+        temp_dev = max(0.0, round(zone_temp[(wh["id"], zone)] - sku["ideal_temp_c"], 1))
 
-        # Create 3-4 lots per SKU with varying ages
         for j in range(np.random.randint(2, 5)):
+            vendor         = sku_vendors[np.random.randint(len(sku_vendors))]
             days_old       = np.random.randint(0, shelf_life + 1)
             days_remaining = shelf_life - days_old
-            pct_remaining  = days_remaining / shelf_life
-
-            proc_date   = today - timedelta(days=days_old)
-            expiry_date = today + timedelta(days=days_remaining)
-
-            # Assign risk level
-            if pct_remaining < 0.20:
-                risk_level = "CRITICAL"
-                risk_score = np.random.randint(82, 100)
-            elif pct_remaining < 0.40:
-                risk_level = "HIGH"
-                risk_score = np.random.randint(62, 82)
-            elif pct_remaining < 0.60:
-                risk_level = "MEDIUM"
-                risk_score = np.random.randint(40, 62)
-            else:
-                risk_level = "LOW"
-                risk_score = np.random.randint(10, 40)
-
-            quantity = round(sku["base_demand"] * np.random.uniform(1.5, 3.0), 1)
+            quantity       = round(sku["base_demand"] * np.random.uniform(1.5, 3.0), 1)
 
             records.append({
                 "lot_id":           f"LOT{2000 + i*10 + j:04d}",
+                "sku_id":           sku["sku_id"],
                 "sku_name":         sku["name"],
                 "category":         sku["category"],
+                "warehouse_id":     wh["id"],
                 "warehouse_name":   wh["name"],
-                "procurement_date": proc_date.strftime("%Y-%m-%d"),
-                "expiry_date":      expiry_date.strftime("%Y-%m-%d"),
-                "days_remaining":   days_remaining,
+                "vendor_id":        vendor["vendor_id"],
+                "vendor_reject_rate": vendor["quality_reject_rate"],
+                "storage_zone":     zone,
+                "procurement_date": (today - timedelta(days=int(days_old))).strftime("%Y-%m-%d"),
+                "expiry_date":      (today + timedelta(days=int(days_remaining))).strftime("%Y-%m-%d"),
+                "days_old":         int(days_old),
+                "days_remaining":   int(days_remaining),
                 "shelf_life_days":  shelf_life,
-                "pct_shelf_remaining": round(pct_remaining * 100, 1),
+                "age_pct":          round(days_old / shelf_life, 2),
+                "pct_shelf_remaining": round(days_remaining / shelf_life * 100, 1),
                 "quantity_kg":      quantity,
+                "over_order_factor": round(np.random.uniform(1.0, 1.6), 2),
                 "price_per_kg":     sku["price_per_kg"],
                 "lot_value_inr":    round(quantity * sku["price_per_kg"], 2),
-                "risk_score":       risk_score,
-                "risk_level":       risk_level,
-                "recommended_action": actions[risk_level],
-                "temp_deviation_c": np.random.choice([0, 0, 0, 2, 4]),
+                "temp_deviation_c": temp_dev,
             })
 
     df = pd.DataFrame(records)
-    df = df.sort_values("risk_score", ascending=False).reset_index(drop=True)
     df.to_csv("data/active_lots.csv", index=False)
     print(f"   ✅ Active lots: {len(df)} lots saved → data/active_lots.csv")
     return df
+
+
+def generate_all():
+    os.makedirs("data", exist_ok=True)
+    df_demand = generate_demand_data()
+    df_lots   = generate_lot_data()
+    generate_vendor_data()
+    df_sensor = generate_sensor_readings()
+    df_active = generate_active_lots(df_sensor)
+    return df_demand, df_lots, df_active
 
 
 # ─────────────────────────────────────────────────────────────
 # MAIN — Run all generators
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    os.makedirs("data", exist_ok=True)
     print("\n🏭 Hyperpure PISA — Data Generator")
     print("=" * 45)
 
-    df_demand = generate_demand_data()
-    df_lots   = generate_lot_data()
-    df_active = generate_active_lots()
+    df_demand, df_lots, df_active = generate_all()
 
     print("\n📋 Summary:")
     print(f"   Demand records : {len(df_demand):,}")

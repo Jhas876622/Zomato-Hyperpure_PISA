@@ -1,0 +1,128 @@
+# Fast unit tests — no trained models, network or API key needed.  Run: pytest -q
+import json
+import os
+import sys
+
+import duckdb
+import httpx
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import ml_models
+import warehouse_db
+from drift import psi, compare
+
+
+# ── Engine 3: newsvendor ─────────────────────────────────────
+def test_newsvendor_orders_below_mean_when_spoilage_costs_more():
+    assert ml_models.compute_optimal_order(100, 20, cu=0.25, co=1.0) < 100
+    assert ml_models.compute_optimal_order(100, 20, cu=1.0, co=1.0) == 100
+    assert ml_models.compute_optimal_order(1, 50) == 0  # never negative
+
+
+# ── Engine 1: lag features stay within one series ────────────
+def test_lag_features_use_previous_day_of_same_series():
+    dates = pd.date_range("2024-01-01", periods=40)
+    df = pd.DataFrame({"date": dates, "actual_demand_kg": np.arange(40.0)})
+    feats = ml_models.build_lag_features(df)
+    assert (feats["lag_1"] == feats["actual_demand_kg"] - 1).all()
+    assert (feats["lag_7"] == feats["actual_demand_kg"] - 7).all()
+
+
+def test_risk_levels():
+    assert [ml_models.risk_level(s) for s in (95, 80, 79, 60, 45, 0)] == \
+           ["CRITICAL", "CRITICAL", "HIGH", "HIGH", "MEDIUM", "LOW"]
+
+
+# ── Drift ────────────────────────────────────────────────────
+def test_psi_flags_shift_only():
+    rng = np.random.default_rng(0)
+    ref = rng.normal(0, 1, 5000)
+    assert psi(ref, rng.normal(0, 1, 5000)) < 0.05
+    assert psi(ref, rng.normal(1.5, 1, 5000)) > 0.2
+    rows = compare(pd.DataFrame({"x": ref}), pd.DataFrame({"x": rng.normal(1.5, 1, 500)}), ["x"])
+    assert rows[0]["drifted"]
+
+
+# ── Warehouse: LLM-facing connection is read-only and sandboxed ──
+@pytest.fixture
+def tiny_db(tmp_path):
+    path = str(tmp_path / "t.duckdb")
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE dim_sku AS SELECT 'SKU001' AS sku_id, 'Spinach' AS sku_name")
+    con.close()
+    return path
+
+
+def test_readonly_query_works(tiny_db):
+    assert warehouse_db.query("SELECT sku_name FROM dim_sku", tiny_db).iloc[0, 0] == "Spinach"
+    assert "dim_sku(sku_id VARCHAR" in warehouse_db.describe_schema(tiny_db)
+
+
+@pytest.mark.parametrize("sql", [
+    "DROP TABLE dim_sku",
+    "INSERT INTO dim_sku VALUES ('x', 'y')",
+    "SELECT * FROM read_csv_auto('config.py')",
+    "COPY dim_sku TO 'leak.csv'",
+])
+def test_readonly_query_blocks_writes_and_file_access(tiny_db, sql):
+    with pytest.raises(duckdb.Error):
+        warehouse_db.query(sql, tiny_db)
+
+
+# ── API ──────────────────────────────────────────────────────
+def test_api_newsvendor_and_auth(monkeypatch):
+    from fastapi.testclient import TestClient
+    import api
+    client = TestClient(api.app)
+
+    body = {"mean_demand_kg": 50, "std_demand_kg": 10}
+    r = client.post("/newsvendor", json=body)
+    assert r.status_code == 200 and r.json()["critical_ratio"] == 0.2
+
+    monkeypatch.setenv("PISA_API_KEY", "secret")
+    assert client.post("/newsvendor", json=body).status_code == 401
+    assert client.post("/newsvendor", json=body, headers={"X-API-Key": "secret"}).status_code == 200
+    assert client.post("/newsvendor", json={"mean_demand_kg": -1, "std_demand_kg": 1},
+                       headers={"X-API-Key": "secret"}).status_code == 422
+
+
+# ── Analyst bot: tool loop against a mocked Claude API ───────
+def test_analyst_runs_sql_tool_then_answers(monkeypatch):
+    import anthropic
+    import analyst
+
+    monkeypatch.setattr(analyst, "describe_schema", lambda db_path: "dim_vendor(vendor_id VARCHAR)")
+    monkeypatch.setattr(analyst, "query", lambda sql, max_rows: pd.DataFrame({"vendor_id": ["V10"]}))
+    requests_seen = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests_seen.append(body)
+        usage = {"input_tokens": 10, "output_tokens": 10}
+        has_result = any(isinstance(m["content"], list) and
+                         any(b.get("type") == "tool_result" for b in m["content"])
+                         for m in body["messages"])
+        if not has_result:
+            content = [{"type": "tool_use", "id": "toolu_1", "name": "run_sql",
+                        "input": {"sql": "SELECT vendor_id FROM dim_vendor"}}]
+            stop = "tool_use"
+        else:
+            content = [{"type": "text", "text": "V10 (Coastal Catch) spoils most."}]
+            stop = "end_turn"
+        return httpx.Response(200, json={
+            "id": "msg_1", "type": "message", "role": "assistant", "model": body["model"],
+            "content": content, "stop_reason": stop, "stop_sequence": None, "usage": usage})
+
+    client = anthropic.Anthropic(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    answer, sqls = analyst.ask("Worst vendor?", client=client)
+
+    assert answer == "V10 (Coastal Catch) spoils most."
+    assert sqls == ["SELECT vendor_id FROM dim_vendor"]
+    assert requests_seen[0]["model"] == "claude-opus-5-5"
+    assert requests_seen[0]["fallbacks"] == "default"
+    tool_result = requests_seen[1]["messages"][-1]["content"][0]
+    assert tool_result["type"] == "tool_result" and "V10" in str(tool_result["content"])

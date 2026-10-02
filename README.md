@@ -8,6 +8,10 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
+![XGBoost](https://img.shields.io/badge/XGBoost-Forecasting-189FDD?style=for-the-badge)
+![MLflow](https://img.shields.io/badge/MLflow-Tracking-0194E2?style=for-the-badge&logo=mlflow&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-REST%20API-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![DuckDB](https://img.shields.io/badge/DuckDB-Warehouse-FFF000?style=for-the-badge&logo=duckdb&logoColor=black)
 ![Scikit Learn](https://img.shields.io/badge/Scikit--Learn-Machine%20Learning-F7931E?style=for-the-badge&logo=scikitlearn&logoColor=white)
 ![Plotly](https://img.shields.io/badge/Plotly-Interactive%20Dashboard-3F4F75?style=for-the-badge&logo=plotly&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-success?style=for-the-badge)
@@ -37,6 +41,49 @@ Traditional inventory planning often relies on historical averages or manual dec
 **PISA (Predictive Inventory & Spoilage Alert System)** is an AI-powered decision support platform designed to solve this problem. It combines demand forecasting, spoilage prediction, and inventory optimization into a single system that helps warehouse managers make smarter procurement and inventory decisions.
 
 Instead of simply showing reports, PISA analyzes operational data and generates actionable recommendations that reduce food waste, improve product availability, and enhance overall warehouse efficiency.
+
+---
+
+# 🏭 Production Architecture (5 Layers)
+
+| Layer | What runs | Code |
+|---|---|---|
+| **1 · Data Sources** | WMS orders & lots, OpenWeatherMap forecasts (seasonal fallback without a key), simulated IoT cold-storage sensors (hourly temp/humidity, door-open spikes, compressor failures), vendor performance | `data_generator.py`, `weather.py` |
+| **2 · Data Engineering** | DuckDB star schema (`fact_orders`, `fact_lots`, `fact_sensor_readings`, `fact_active_lots`, `dim_sku/warehouse/vendor/date`) + SQL marts; nightly ETL | `warehouse_db.py`, `pipeline.py` |
+| **3 · ML & Intelligence** | Engine 1: XGBoost demand forecast · Engine 2: Random Forest risk + Cox survival (P(spoil in 48h)) · Engine 3: Newsvendor order quantity | `ml_models.py` |
+| **4 · MLOps** | MLflow tracking + model registry, KS/PSI drift monitoring that triggers retraining, GitHub Actions CI + nightly pipeline, Docker Compose | `drift.py`, `.github/workflows/`, `Dockerfile`, `docker-compose.yml` |
+| **5 · Product & API** | Streamlit dashboard (6 tabs), FastAPI REST service, "Ask PISA" Claude analyst bot (text-to-SQL over DuckDB) | `app.py`, `api.py`, `analyst.py` |
+
+### Current model results (30-day time-based holdout)
+
+| Engine | Metric |
+|---|---|
+| Demand (XGBoost) | **11.6% MAPE** vs 18.3% same-day-last-week baseline (36% lower error) |
+| Spoilage (Random Forest) | F1 0.84 · ROC-AUC 0.90 |
+| Time-to-spoilage (Cox PH) | Concordance index 0.77 |
+
+### Run it
+
+```bash
+pip install -r requirements-dev.txt
+python pipeline.py              # ingest → drift check → train → score lots → build DuckDB
+streamlit run app.py            # dashboard  → http://localhost:8501
+uvicorn api:app --reload        # REST API   → http://localhost:8000/docs
+mlflow ui                       # experiments → http://localhost:5000
+pytest -q                       # tests
+```
+
+Or everything at once with `docker compose up --build`.
+
+| Env var | Enables |
+|---|---|
+| `ANTHROPIC_API_KEY` | "Ask PISA" analyst bot (dashboard tab 6, `python analyst.py "question"`) |
+| `OPENWEATHER_API_KEY` | Live weather in forecasts |
+| `PISA_API_KEY` | Requires `X-API-Key` header on the REST API |
+
+**API endpoints:** `GET /health` · `GET /forecast/{sku_id}/{warehouse_id}` · `POST /spoilage/score` · `GET /alerts` · `POST /newsvendor` · `GET /monitoring/drift`
+
+**Deliberate simplifications:** GitHub Actions cron stands in for Airflow, plain SQL views in DuckDB stand in for dbt, and drift checks use scipy (KS + PSI) instead of Evidently. Metabase is not included; it can connect to `data/pisa.duckdb` through the community DuckDB driver.
 
 ---
 
@@ -343,7 +390,7 @@ This enables procurement teams to purchase inventory before demand actually occu
 
 ### Model Used
 
-Gradient Boosting Regressor
+XGBoost Regressor
 
 The model learns demand patterns from:
 
@@ -391,7 +438,7 @@ Using these inputs, it calculates the spoilage probability.
 
 ### Model Used
 
-Random Forest Classifier
+Random Forest Classifier (risk score) + Cox Proportional Hazards survival model (time to spoilage)
 
 ### Example
 
@@ -611,7 +658,7 @@ The processed data is passed to the machine learning pipeline.
 
 The pipeline consists of two predictive models:
 
-- **Gradient Boosting Regressor** for demand forecasting.
+- **XGBoost Regressor** for demand forecasting.
 - **Random Forest Classifier** for spoilage prediction.
 
 Each model focuses on solving a different operational problem while sharing the same engineered feature set.
@@ -715,7 +762,7 @@ This module contains the complete Machine Learning pipeline.
 
 Implemented models include:
 
-### Gradient Boosting Regressor
+### XGBoost Regressor
 
 Predicts future product demand.
 
@@ -1004,7 +1051,7 @@ This demonstrates how PISA transforms predictive analytics into practical operat
 
 ✔ Synthetic Supply Chain Data Generation
 
-✔ Demand Forecasting using Gradient Boosting
+✔ Demand Forecasting using XGBoost
 
 ✔ Spoilage Prediction using Random Forest
 

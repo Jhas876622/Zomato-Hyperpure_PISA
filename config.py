@@ -85,3 +85,35 @@ ALERT_YELLOW = 0.60   # 40-60% shelf life left → CAUTION
 # Cost assumptions for Newsvendor Model (for interview discussion)
 COST_OF_OVERSTOCKING_PCT  = 1.00   # 100% loss if spoiled
 COST_OF_UNDERSTOCKING_PCT = 0.25   # 25% margin + trust cost if stockout
+
+# ── Vendors (simulated performance data) ──────────────────────
+# quality_reject_rate feeds spoilage risk: poorer inbound quality → faster spoilage
+VENDORS = [
+    {"vendor_id": "V01", "name": "Kisan Fresh Farms",   "category": "Leafy Vegetables", "quality_reject_rate": 0.04, "on_time_rate": 0.95},
+    {"vendor_id": "V02", "name": "GreenLeaf Mandi Co.", "category": "Leafy Vegetables", "quality_reject_rate": 0.11, "on_time_rate": 0.82},
+    {"vendor_id": "V03", "name": "Deccan Veg Traders",  "category": "Other Vegetables", "quality_reject_rate": 0.05, "on_time_rate": 0.91},
+    {"vendor_id": "V04", "name": "Sahyadri Produce",    "category": "Other Vegetables", "quality_reject_rate": 0.09, "on_time_rate": 0.86},
+    {"vendor_id": "V05", "name": "Nashik Roots Co.",    "category": "Root Vegetables",  "quality_reject_rate": 0.03, "on_time_rate": 0.93},
+    {"vendor_id": "V06", "name": "Agra Cold Store",     "category": "Root Vegetables",  "quality_reject_rate": 0.06, "on_time_rate": 0.88},
+    {"vendor_id": "V07", "name": "Amul Distributor",    "category": "Dairy",            "quality_reject_rate": 0.02, "on_time_rate": 0.97},
+    {"vendor_id": "V08", "name": "Local Dairy Collective","category": "Dairy",          "quality_reject_rate": 0.10, "on_time_rate": 0.80},
+    {"vendor_id": "V09", "name": "Venky's Supply",      "category": "Meat & Poultry",   "quality_reject_rate": 0.04, "on_time_rate": 0.92},
+    {"vendor_id": "V10", "name": "Coastal Catch",       "category": "Meat & Poultry",   "quality_reject_rate": 0.12, "on_time_rate": 0.79},
+]
+
+# ── Cold-storage zones (simulated IoT sensors) ────────────────
+# SKUs with ideal_temp_c <= CHILLER_MAX_IDEAL_C live in the chiller, rest in the cool room
+STORAGE_ZONES = {"CHILLER": {"setpoint_c": 3.0, "humidity_pct": 90},
+                 "COOL_ROOM": {"setpoint_c": 12.0, "humidity_pct": 85}}
+CHILLER_MAX_IDEAL_C = 4
+SENSOR_HISTORY_DAYS = 7
+
+# ── Risk thresholds on model score (0-100) ────────────────────
+RISK_LEVELS = [(80, "CRITICAL"), (60, "HIGH"), (40, "MEDIUM"), (0, "LOW")]
+
+# ── Paths & external services ─────────────────────────────────
+DATA_DIR    = "data"
+MODELS_DIR  = "models"
+REPORTS_DIR = "reports"
+DB_PATH     = "data/pisa.duckdb"
+CLAUDE_MODEL = "claude-opus-5-5"
