@@ -1,11 +1,17 @@
 # docker compose up --build
 #   Dashboard  http://localhost:8501
 #   API docs   http://localhost:8000/docs
-# Keys are read from your shell or a .env file next to this file:
-#   GROQ_API_KEY / ANTHROPIC_API_KEY, OPENWEATHER_API_KEY, PISA_API_KEY
 #
-# Named volumes (not ./data bind mounts): on first run Docker seeds them with the
-# data and models baked into the image, and both services share them.
+# Before the first run:
+#   1. cp .streamlit/secrets.example.toml .streamlit/secrets.toml and fill in [auth] + [access]
+#      (the image runs with PISA_ENV=production, so the dashboard requires sign-in).
+#      For an open demo instead, set PISA_ENV=demo in .env.
+#   2. Put PISA_API_KEY (required by the API) and optional keys in a .env file next to this file:
+#      GROQ_API_KEY / ANTHROPIC_API_KEY, OPENWEATHER_API_KEY, ALERT_WEBHOOK_URL
+#
+# Named volumes (not ./data bind mounts): on first run Docker seeds them with the data
+# and models baked into the image, and both services share them. Redis holds the
+# rate-limit counters so limits hold across replicas.
 
 services:
   dashboard:
@@ -16,12 +22,18 @@ services:
     ports:
       - "8501:8501"
     environment:
+      - PISA_ENV=${PISA_ENV:-production}
+      - REDIS_URL=redis://redis:6379/0
       - GROQ_API_KEY=${GROQ_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
     volumes:
       - pisa-data:/app/data
       - pisa-models:/app/models
+      - ./.streamlit:/app/.streamlit:ro   # theme + your secrets.toml, never baked into the image
+    depends_on:
+      - redis
     command: ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
 
   api:
@@ -30,10 +42,13 @@ services:
     restart: unless-stopped
     depends_on:
       - dashboard   # reuses the image the dashboard service builds
+      - redis
     ports:
       - "8000:8000"
     environment:
+      - PISA_ENV=${PISA_ENV:-production}
       - PISA_API_KEY=${PISA_API_KEY:-}
+      - REDIS_URL=redis://redis:6379/0
       - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-}
       - PORT=8000
     volumes:
@@ -46,6 +61,12 @@ services:
       start_period: 20s
       retries: 3
     command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  redis:
+    image: redis:7-alpine
+    container_name: pisa-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # counters only; nothing to persist
 
 volumes:
   pisa-data:

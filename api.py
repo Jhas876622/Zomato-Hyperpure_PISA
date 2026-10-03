@@ -6,15 +6,15 @@
 #       Fails closed: with PISA_ENV=production (set in the Dockerfile) and no
 #       PISA_API_KEY, protected endpoints return 503 instead of running open.
 #       Locally (PISA_ENV unset) a missing key leaves the API open for development.
-# Limits: RATE_LIMIT_PER_MIN requests per client IP; standard security headers.
+# Limits: RATE_LIMIT_PER_MIN requests per client IP (shared via Redis when REDIS_URL is set);
+#         standard security headers.
 # HTTPS: terminate TLS in front of this service (reverse proxy / platform).
 # =============================================================
 
 import json
 import os
 import secrets
-import time
-from collections import defaultdict, deque
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Literal
 
@@ -25,7 +25,8 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field
 
 import ml_models
-from config import DATA_DIR, REPORTS_DIR, SKUS, WAREHOUSES
+import ratelimit
+from config import DATA_DIR, PIPELINE_STALE_HOURS, REPORTS_DIR, SKUS, WAREHOUSES
 
 app = FastAPI(title="PISA API", version="1.0",
               description="Predictive Inventory & Spoilage Alerts — Zomato Hyperpure B2B")
@@ -41,21 +42,13 @@ SECURITY_HEADERS = {
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",  # honoured only over HTTPS
 }
 
-# ponytail: in-memory, per-process limiter; use a shared store (e.g. Redis) if you run >1 worker
-_hits = defaultdict(deque)
-
-
 @app.middleware("http")
 async def rate_limit_and_headers(request: Request, call_next):
     ip = request.client.host if request.client else "unknown"
-    now, window = time.monotonic(), _hits[ip]
-    while window and now - window[0] > 60:
-        window.popleft()
-    if len(window) >= RATE_LIMIT_PER_MIN:
+    if not ratelimit.hit(f"api:{ip}", RATE_LIMIT_PER_MIN, 60):
         response = JSONResponse({"detail": "Too many requests, slow down."}, status_code=429,
                                 headers={"Retry-After": "60"})
     else:
-        window.append(now)
         response = await call_next(request)
     response.headers.update(SECURITY_HEADERS)
     return response
@@ -127,6 +120,22 @@ def health():
 ALERT_FIELDS = ["lot_id", "sku_id", "sku_name", "category", "warehouse_id", "warehouse_name",
                 "days_remaining", "quantity_kg", "lot_value_inr", "risk_score", "risk_level",
                 "spoil_prob_48h", "recommended_action"]
+
+
+@app.get("/health/pipeline")
+def pipeline_health():
+    """For uptime monitors: 200 when the last nightly run succeeded recently, else 503 with the reason."""
+    path = os.path.join(REPORTS_DIR, "pipeline_run.json")
+    if not os.path.exists(path):
+        return JSONResponse({"status": "never_run"}, status_code=503)
+    with open(path) as f:
+        run = json.load(f)
+    age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(run["finished_at"])).total_seconds() / 3600
+    status = ("failed" if run.get("status") == "failed"
+              else "stale" if age_h > PIPELINE_STALE_HOURS else "ok")
+    body = {"status": status, "last_run_hours_ago": round(age_h, 1),
+            "quality_breaches": run.get("quality_breaches", []), "promoted": run.get("promoted")}
+    return JSONResponse(body, status_code=200 if status == "ok" else 503)
 
 
 @app.get("/forecast/{sku_id}/{warehouse_id}", dependencies=[Depends(require_api_key)])

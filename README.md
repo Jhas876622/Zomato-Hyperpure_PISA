@@ -51,8 +51,8 @@ Instead of simply showing reports, PISA analyzes operational data and generates 
 | **1 · Data Sources** | WMS orders & lots, OpenWeatherMap forecasts (seasonal fallback without a key), simulated IoT cold-storage sensors (hourly temp/humidity, door-open spikes, compressor failures), vendor performance | `data_generator.py`, `weather.py` |
 | **2 · Data Engineering** | DuckDB star schema (`fact_orders`, `fact_lots`, `fact_sensor_readings`, `fact_active_lots`, `dim_sku/warehouse/vendor/date`) + SQL marts; nightly ETL | `warehouse_db.py`, `pipeline.py` |
 | **3 · ML & Intelligence** | Engine 1: XGBoost demand forecast · Engine 2: Random Forest risk + Cox survival (P(spoil in 48h)) · Engine 3: Newsvendor order quantity | `ml_models.py` |
-| **4 · MLOps** | MLflow tracking + model registry (local, via `requirements-dev.txt`), KS/PSI drift monitoring that triggers retraining, GitHub Actions CI + nightly pipeline, Docker Compose | `drift.py`, `.github/workflows/`, `Dockerfile`, `docker-compose.yml` |
-| **5 · Product & API** | Streamlit dashboard (6 tabs), FastAPI REST service, "Ask PISA" LLM analyst: Groq by default, Claude optional (text-to-SQL over DuckDB) | `app.py`, `api.py`, `analyst.py` |
+| **4 · MLOps** | MLflow tracking (`pip install mlflow`), champion/challenger model promotion with SHA-256 integrity checks, KS/PSI drift monitoring that triggers retraining, Slack/Discord/Teams alerts, GitHub Actions CI + nightly pipeline, Docker Compose + Redis | `ml_models.py`, `drift.py`, `alerts.py`, `.github/workflows/`, `Dockerfile`, `docker-compose.yml` |
+| **5 · Product & API** | Streamlit dashboard (6 tabs) with SSO login and roles, FastAPI REST service, "Ask PISA" LLM analyst: Groq by default, Claude optional (text-to-SQL over DuckDB) | `app.py`, `auth.py`, `api.py`, `analyst.py` |
 
 ### Current model results (30-day time-based holdout)
 
@@ -69,11 +69,12 @@ pip install -r requirements.txt
 python pipeline.py              # ingest → drift check → train → score lots → build DuckDB
 streamlit run app.py            # dashboard  → http://localhost:8501
 uvicorn api:app --reload        # REST API   → http://localhost:8000/docs
-mlflow ui --backend-store-uri sqlite:///mlflow.db   # experiments → http://localhost:5000
-pytest -q                       # tests
+mlflow ui --backend-store-uri sqlite:///mlflow.db   # experiments (pip install mlflow first)
+pytest -q                       # tests (offline)
+RUN_LIVE_TESTS=1 pytest -q tests/test_live.py      # one real Groq call (spends API quota)
 ```
 
-Or run the dashboard (:8501) and REST API (:8000) with `docker compose up --build`. Put your keys in a `.env` file next to `docker-compose.yml`. The image installs only `requirements.txt`, so MLflow tracking and `mlflow ui` are local-only.
+Or run the dashboard (:8501), REST API (:8000) and Redis with `docker compose up --build`. Copy `.streamlit/secrets.example.toml` to `.streamlit/secrets.toml` first (the image requires sign-in; set `PISA_ENV=demo` in `.env` for an open demo), and put `PISA_API_KEY` and other keys in `.env`. The image doesn't install MLflow, so experiment tracking is local-only.
 
 | Env var | Enables |
 |---|---|
@@ -82,18 +83,39 @@ Or run the dashboard (:8501) and REST API (:8000) with `docker compose up --buil
 | `OPENWEATHER_API_KEY` | Live weather in forecasts (seasonal fallback without key) |
 | `PISA_API_KEY` | Requires `X-API-Key` header on the REST API |
 | `MLFLOW_TRACKING_URI` | MLflow store (default `sqlite:///mlflow.db`) |
-| `PISA_ENV` | `production` (set in the Dockerfile) makes the API refuse to run without `PISA_API_KEY` |
+| `PISA_ENV` | `production` (Docker default): the dashboard requires SSO and the API requires `PISA_API_KEY` |
+| `ALERT_WEBHOOK_URL` | Slack / Discord / Teams webhook for pipeline failures and model-quality alerts |
+| `REDIS_URL` | Shares rate-limit counters across replicas (set automatically in Docker Compose) |
+
+### Login and roles
+
+Sign-in uses Streamlit's built-in SSO (Google, Microsoft Entra ID, Okta, Auth0 …). Configure `[auth]` and `[access]` in secrets; see `.streamlit/secrets.example.toml`.
+
+| Role | Sees | Ask PISA |
+|---|---|---|
+| Admin | All hubs | Yes |
+| Hub manager | Only their own hub (filter locked) | No |
+| Viewer | All hubs, read-only | No |
+
+Without an `[auth]` section the app runs as an open demo with a banner. With `PISA_ENV=production` it refuses to start instead.
+
+### Monitoring
+
+- **Alerts:** a failed pipeline, a model metric past `config.QUALITY_FLOORS`, or a rejected retrain is posted to `ALERT_WEBHOOK_URL`. The nightly GitHub workflow also alerts if the job dies before the pipeline starts.
+- **Champion/challenger:** a retrained model replaces the current one only if it isn't worse (`config.PROMOTION_TOLERANCE`). Otherwise the old model keeps serving and you get an alert.
+- **Integrity:** `models/manifest.json` stores each model file's SHA-256. The app refuses to load a model file that doesn't match.
+- **Uptime:** point an uptime monitor (UptimeRobot, Better Stack…) at `GET /health/pipeline`. It returns 503 if the last run failed or is older than 26 hours.
 
 ### Security
 
 - **Secrets:** keys live only in env vars or `.streamlit/secrets.toml`, which is git-ignored and excluded from Docker images by `.dockerignore`. Nothing secret is in the code or the git history.
 - **LLM-written SQL:** runs on a read-only DuckDB connection with no file or network access, capped at 512 MB and 2 threads. The query cannot change these settings.
-- **Ask PISA:** questions are capped at 500 characters, 20 per visitor per hour and 300 per hour across the app, so a public deployment can't drain your LLM quota.
+- **Ask PISA:** admins only; questions are capped at 500 characters, 20 per person per hour and 300 per hour across the app (shared via Redis when `REDIS_URL` is set).
 - **REST API:** requires `X-API-Key` in production, rejects unknown fields, is rate-limited per IP (`PISA_RATE_LIMIT_PER_MIN`, default 60), returns only the fields clients need, and sends security headers.
 - **HTTPS:** the containers serve plain HTTP. Put them behind a TLS-terminating reverse proxy or a platform that provides HTTPS (Streamlit Cloud does this for you).
 - **Dependencies:** CI runs `pip-audit` on every push.
 
-**API endpoints:** `GET /health` · `GET /forecast/{sku_id}/{warehouse_id}` · `POST /spoilage/score` · `GET /alerts` · `POST /newsvendor` · `GET /monitoring/drift`
+**API endpoints:** `GET /health` · `GET /health/pipeline` · `GET /forecast/{sku_id}/{warehouse_id}` · `POST /spoilage/score` · `GET /alerts` · `POST /newsvendor` · `GET /monitoring/drift`
 
 **Deliberate simplifications:** GitHub Actions cron stands in for Airflow, plain SQL views in DuckDB stand in for dbt, and drift checks use scipy (KS + PSI) instead of Evidently. Metabase is not included; it can connect to `data/pisa.duckdb` through the community DuckDB driver.
 
@@ -727,7 +749,8 @@ PISA/
 ├── .github/workflows/      # CI + nightly pipeline
 ├── .streamlit/config.toml  # theme
 ├── Dockerfile, docker-compose.yml
-├── requirements.txt, requirements-dev.txt
+├── auth.py, alerts.py, ratelimit.py
+├── requirements.txt
 └── data/, models/, reports/   # generated by pipeline.py (git-ignored)
 ```
 

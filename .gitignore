@@ -11,7 +11,7 @@ env/
 
 # Project specific
 data/*.csv
-models/*.pkl
+models/
 .streamlit/secrets.toml
 data/*.duckdb
 data/*.tmp

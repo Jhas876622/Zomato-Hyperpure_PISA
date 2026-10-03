@@ -118,3 +118,12 @@ REPORTS_DIR = "reports"
 DB_PATH     = "data/pisa.duckdb"
 CLAUDE_MODEL = "claude-opus-5-5"
 GROQ_MODEL   = "openai/gpt-oss-120b"
+
+# ── Model quality & monitoring ────────────────────────────────
+# A metric past its floor raises an alert after every pipeline run.
+QUALITY_FLOORS = {"demand_avg_mape_max": 20.0, "spoilage_f1_min": 0.70, "survival_c_index_min": 0.65}
+# A retrained model is only promoted to champion if it is not worse than the current
+# one by more than these margins (MAPE in points, F1 / C-index absolute).
+PROMOTION_TOLERANCE = {"demand_avg_mape": 1.0, "spoilage_f1": 0.02, "survival_c_index": 0.02}
+# /health/pipeline reports "stale" when the last successful run is older than this.
+PIPELINE_STALE_HOURS = 26

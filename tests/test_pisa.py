@@ -229,7 +229,8 @@ def test_readonly_sql_cannot_unlock_its_own_limits(tiny_db):
 def api_client():
     from fastapi.testclient import TestClient
     import api
-    api._hits.clear()
+    import ratelimit
+    ratelimit.reset()
     return TestClient(api.app), api
 
 
@@ -259,3 +260,111 @@ def test_api_rate_limits_per_client(monkeypatch, api_client):
     monkeypatch.setattr(api, "RATE_LIMIT_PER_MIN", 3)
     codes = [client.post("/newsvendor", json=BODY).status_code for _ in range(4)]
     assert codes == [200, 200, 200, 429]
+
+
+# ── Login / roles ────────────────────────────────────────────
+ACCESS = {"admins": ["Boss@Co.com"], "viewers": ["analyst@co.com"],
+          "hub_managers": {"WH_DEL_01": ["delhi@co.com"], "WH_BAD": ["ghost@co.com"]}}
+
+
+@pytest.mark.parametrize("email, expected", [
+    ("boss@co.com", ("admin", None)),              # case-insensitive
+    ("delhi@co.com", ("hub_manager", "WH_DEL_01")),
+    ("analyst@co.com", ("viewer", None)),
+    ("stranger@co.com", None),                     # not listed → no access
+    ("ghost@co.com", None),                        # unknown warehouse id → no access
+    ("", None),
+])
+def test_resolve_role(email, expected):
+    import auth
+    assert auth.resolve_role(email, ACCESS) == expected
+
+
+def test_allow_any_viewer_and_only_admins_can_ask():
+    import auth
+    assert auth.resolve_role("anyone@co.com", {**ACCESS, "allow_any_viewer": True}) == ("viewer", None)
+    assert auth.User("a", "A", "admin").can_ask
+    assert not auth.User("v", "V", "viewer").can_ask
+    assert not auth.User("m", "M", "hub_manager", hub="Delhi North Hub").can_ask
+
+
+# ── Shared rate limiter ──────────────────────────────────────
+def test_ratelimit_counts_per_key(monkeypatch):
+    import ratelimit
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    ratelimit.reset()
+    assert [ratelimit.hit("a", 2, 60) for _ in range(3)] == [True, True, False]
+    assert ratelimit.hit("b", 2, 60)  # other keys unaffected
+
+
+# ── Model registry: integrity + champion/challenger ──────────
+def test_load_refuses_tampered_model(tmp_path):
+    for f in ml_models.MODEL_FILES:
+        (tmp_path / f).write_bytes(b"model")
+    manifest = {"sha256": {f: ml_models._sha256(tmp_path / f) for f in ml_models.MODEL_FILES}}
+    (tmp_path / ml_models.MANIFEST).write_text(json.dumps(manifest))
+    (tmp_path / "spoilage_model.pkl").write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="does not match"):
+        ml_models.load_artifacts(str(tmp_path))
+
+
+def test_challenger_regressions():
+    champ = {"demand_avg_mape": 11.6, "spoilage_f1": 0.84, "survival_c_index": 0.77}
+    tol = {"demand_avg_mape": 1.0, "spoilage_f1": 0.02, "survival_c_index": 0.02}
+    assert ml_models.regressions({**champ, "demand_avg_mape": 12.4}, champ, tol) == []   # within tolerance
+    worse = ml_models.regressions({**champ, "demand_avg_mape": 14.0, "spoilage_f1": 0.70}, champ, tol)
+    assert len(worse) == 2
+
+
+# ── Monitoring ───────────────────────────────────────────────
+def test_quality_breaches_and_failure_alert(monkeypatch, tmp_path):
+    import pipeline
+    assert pipeline.quality_breaches({"demand_avg_mape": 11.6, "spoilage_f1": 0.84, "survival_c_index": 0.77}) == []
+    assert len(pipeline.quality_breaches({"demand_avg_mape": 25, "spoilage_f1": 0.5, "survival_c_index": 0.5})) == 3
+
+    sent = []
+    monkeypatch.setattr(pipeline, "send_alert", lambda title, details=(), level="error": sent.append((title, level)))
+    monkeypatch.setattr(pipeline, "REPORTS_DIR", str(tmp_path))
+    monkeypatch.setattr(pipeline, "run", lambda **kw: (_ for _ in ()).throw(ValueError("disk full")))
+    with pytest.raises(ValueError):
+        pipeline.main()
+    assert sent == [("Nightly pipeline FAILED", "error")]
+    assert json.loads((tmp_path / "pipeline_run.json").read_text())["status"] == "failed"
+
+
+def test_alert_posts_to_webhook(monkeypatch):
+    import alerts
+    calls = []
+    monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://hooks.example/x")
+    monkeypatch.setattr(alerts.requests, "post",
+                        lambda url, json, timeout: calls.append(json) or type("R", (), {"raise_for_status": lambda s: None})())
+    assert alerts.send_alert("Test", ["detail"], level="warning")
+    assert "Test" in calls[0]["text"] and calls[0]["text"] == calls[0]["content"]
+
+
+def test_pipeline_health_endpoint(monkeypatch, tmp_path, api_client):
+    from datetime import datetime, timedelta, timezone
+    client, api = api_client
+    monkeypatch.setattr(api, "REPORTS_DIR", str(tmp_path))
+    assert client.get("/health/pipeline").status_code == 503              # never run
+
+    def report(hours_ago, status="ok"):
+        t = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+        (tmp_path / "pipeline_run.json").write_text(json.dumps({"status": status, "finished_at": t}))
+    report(1)
+    assert client.get("/health/pipeline").json()["status"] == "ok"
+    report(30)
+    assert client.get("/health/pipeline").json()["status"] == "stale"
+    report(1, status="failed")
+    assert client.get("/health/pipeline").status_code == 503
+
+
+def test_ratelimit_shares_counts_through_redis(monkeypatch):
+    fakeredis = pytest.importorskip("fakeredis")
+    import ratelimit
+    server = fakeredis.FakeServer()
+    replica_a, replica_b = fakeredis.FakeRedis(server=server), fakeredis.FakeRedis(server=server)
+    monkeypatch.setattr(ratelimit, "_client", lambda: replica_a)
+    assert ratelimit.hit("ip", 2, 60) and ratelimit.hit("ip", 2, 60)
+    monkeypatch.setattr(ratelimit, "_client", lambda: replica_b)   # a second server sees the same count
+    assert not ratelimit.hit("ip", 2, 60)

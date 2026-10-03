@@ -1,6 +1,8 @@
 name: Nightly pipeline
 
-# Ingest → drift check → retrain on drift → score lots → rebuild DuckDB
+# Ingest → drift check → retrain on drift (champion/challenger) → score lots → rebuild DuckDB
+# Failures and model-quality breaches are sent to the ALERT_WEBHOOK_URL repo secret
+# (Slack / Discord / Teams incoming webhook).
 on:
   schedule:
     - cron: "30 20 * * *"   # 02:00 IST
@@ -16,22 +18,32 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+      ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements*.txt
-      - run: pip install -r requirements-dev.txt
+      - run: pip install -r requirements.txt mlflow
       - run: python pipeline.py ${{ inputs.force_train && '--force-train' || '' }}
       - name: Job summary
+        if: always()
         run: |
           echo '### PISA nightly run' >> "$GITHUB_STEP_SUMMARY"
           echo '```json' >> "$GITHUB_STEP_SUMMARY"
-          cat reports/pipeline_run.json >> "$GITHUB_STEP_SUMMARY"
+          cat reports/pipeline_run.json >> "$GITHUB_STEP_SUMMARY" || echo '{"status": "no report"}' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+      # pipeline.py alerts on its own failures; this catches the job dying before it runs
+      # (e.g. pip install failing).
+      - name: Alert on job failure
+        if: failure() && env.ALERT_WEBHOOK_URL != ''
+        run: |
+          MSG="🔴 PISA ERROR: nightly workflow failed — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"$MSG\", \"content\": \"$MSG\"}" "$ALERT_WEBHOOK_URL"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: pisa-run-${{ github.run_number }}
           path: |

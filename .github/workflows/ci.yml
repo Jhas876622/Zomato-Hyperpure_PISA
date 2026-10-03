@@ -17,6 +17,33 @@ jobs:
       - run: pip install -r requirements.txt pytest httpx
       - run: pytest -q
 
+  docker:
+    # Builds the real image (which runs the full pipeline) and smoke-tests the running stack
+    runs-on: ubuntu-latest
+    env:
+      PISA_API_KEY: ci-test-key
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up --build -d
+      - name: Wait for dashboard and API
+        run: |
+          for i in $(seq 1 60); do
+            curl -fs http://localhost:8501/_stcore/health && curl -fs http://localhost:8000/health && exit 0
+            sleep 5
+          done
+          exit 1
+      - name: API rejects missing key, accepts the right one
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/alerts)" = 401
+          curl -fs -H "X-API-Key: $PISA_API_KEY" http://localhost:8000/alerts | grep -q '"count"'
+          curl -fs http://localhost:8000/health/pipeline
+      - name: Rate limits are shared through Redis
+        run: docker compose exec -T redis redis-cli --scan --pattern 'pisa:rl:*' | grep -q pisa:rl
+      - if: failure()
+        run: docker compose logs --tail 200
+      - if: always()
+        run: docker compose down -v
+
   dependency-audit:
     runs-on: ubuntu-latest
     steps:

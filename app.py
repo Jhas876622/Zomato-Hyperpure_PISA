@@ -24,6 +24,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from config import SKUS, WAREHOUSES, DB_PATH, REPORTS_DIR, CLAUDE_MODEL
 import ml_models
+import auth
 
 # ── Auto-setup: generate data + train models if missing ──────
 @st.cache_resource(show_spinner=False)
@@ -32,7 +33,7 @@ def auto_setup():
     need_ingest = not os.path.exists("data/sensor_readings.csv")  # pre-v2 data lacks sensors/vendors
     if need_ingest or not os.path.exists("models/spoilage_model.pkl") or not os.path.exists(DB_PATH):
         import pipeline
-        pipeline.run(skip_ingest=not need_ingest)
+        pipeline.main(skip_ingest=not need_ingest)  # records + alerts on failure
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -271,27 +272,16 @@ SESSION_LLM_PER_HOUR = 20
 GLOBAL_LLM_PER_HOUR  = 300
 
 
-@st.cache_resource
-def _global_llm_calls():
-    # ponytail: per-process deque; a multi-replica deployment needs a shared store
-    from collections import deque
-    return deque()
-
-
-def llm_rate_limited():
-    """Records one LLM call and returns a message if this visitor or the whole app is over its hourly cap."""
-    import time
-    now = time.time()
-    session_calls = [t for t in st.session_state.get("llm_calls", []) if now - t < 3600]
-    global_calls = _global_llm_calls()
-    while global_calls and now - global_calls[0] > 3600:
-        global_calls.popleft()
-    if len(session_calls) >= SESSION_LLM_PER_HOUR:
+def llm_rate_limited(user):
+    """Records one LLM call; returns a message if this person or the whole app is over its hourly cap.
+    Counted per signed-in email (per browser session in demo mode), shared via Redis when REDIS_URL is set."""
+    import uuid
+    import ratelimit
+    who = user.email or st.session_state.setdefault("visitor_id", uuid.uuid4().hex)
+    if not ratelimit.hit(f"llm:user:{who}", SESSION_LLM_PER_HOUR, 3600):
         return f"You've asked {SESSION_LLM_PER_HOUR} questions in the last hour. Please try again later."
-    if len(global_calls) >= GLOBAL_LLM_PER_HOUR:
-        return "Ask PISA is busy right now (hourly limit reached for this demo). Please try again later."
-    st.session_state["llm_calls"] = session_calls + [now]
-    global_calls.append(now)
+    if not ratelimit.hit("llm:global", GLOBAL_LLM_PER_HOUR, 3600):
+        return "Ask PISA is busy right now (hourly limit reached). Please try again later."
     return None
 
 
@@ -970,9 +960,14 @@ def get_morning_briefing_stats(active_lots):
 # ─────────────────────────────────────────────────────────────
 # TAB 6: ASK PISA (AI Copilot & Operations Analyst)
 # ─────────────────────────────────────────────────────────────
-def tab_ask(active_lots):
+def tab_ask(active_lots, user):
     tab_intro("Ask PISA", "Ask questions in English or Hinglish. The AI analyst writes DuckDB SQL against "
               "live warehouse marts, computes exact figures, and drafts operational actions.")
+
+    if not user.can_ask:
+        st.info("Ask PISA is available to admins, because it can query every hub's data. "
+                "Ask your PISA admin if you need access.")
+        return
 
     key = get_llm_key()
     if not key:
@@ -1053,7 +1048,7 @@ def tab_ask(active_lots):
                              max_chars=MAX_QUESTION_CHARS) or clicked
     if not question:
         return
-    blocked = llm_rate_limited()
+    blocked = llm_rate_limited(user)
     if blocked:
         st.warning(blocked)
         return
@@ -1085,14 +1080,27 @@ def tab_ask(active_lots):
 ALL_HUBS = "All hubs"
 
 
-def render_sidebar():
-    """Renders the hub/category filters. Returns (selected_warehouse, selected_categories)."""
+ROLE_LABEL = {"admin": "Admin", "hub_manager": "Hub manager", "viewer": "Viewer"}
+
+
+def render_sidebar(user):
+    """Renders the hub/category filters. Returns (selected_warehouse, selected_categories).
+    Hub managers are locked to their own hub."""
     with st.sidebar:
         st.markdown('<div class="side-mark">PISA</div>'
                     '<div class="side-sub">Predictive inventory and spoilage alerts</div>',
                     unsafe_allow_html=True)
 
-        sel_warehouse = st.selectbox("Hub", [ALL_HUBS] + [w["name"] for w in WAREHOUSES])
+        if user.demo:
+            st.caption("Demo mode: sign-in is off. Add an [auth] section to secrets to require login.")
+        else:
+            st.markdown(f"**{html.escape(user.name)}**  \n{ROLE_LABEL[user.role]}"
+                        + (f", {html.escape(user.hub)}" if user.hub else ""))
+            if st.button("Sign out", width="stretch"):
+                st.logout()
+
+        hubs = [user.hub] if user.hub else [ALL_HUBS] + [w["name"] for w in WAREHOUSES]
+        sel_warehouse = st.selectbox("Hub", hubs, disabled=bool(user.hub))
         categories = sorted({s["category"] for s in SKUS})
         sel_categories = st.multiselect("Categories", categories, default=categories)
 
@@ -1122,6 +1130,8 @@ def apply_filters(df, sel_warehouse, sel_categories, warehouse_col="warehouse_na
 
 
 def main():
+    user = auth.require_user()  # stops here with a sign-in page until the visitor is allowed in
+
     # First-run setup
     with st.spinner("First run: generating data and training models. This takes a few minutes."):
         auto_setup()
@@ -1136,7 +1146,7 @@ def main():
     sku_models = dm_artifact.get("models", None)
 
     sensors = load_sensors()
-    sel_warehouse, sel_categories = render_sidebar()
+    sel_warehouse, sel_categories = render_sidebar(user)
     render_header(sensors)
 
     # Apply sidebar filters to data
@@ -1163,7 +1173,7 @@ def main():
     with tab3: tab_alerts(active_lots_f, sensors)
     with tab4: tab_inventory(lot_df_f, demand_df_f)
     with tab5: tab_model_health(sp_artifact, dm_artifact, lot_df_f)
-    with tab6: tab_ask(active_lots_f)
+    with tab6: tab_ask(active_lots_f, user)
 
 
 if __name__ == "__main__":

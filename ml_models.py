@@ -11,14 +11,18 @@
 #
 # Engine 3: Newsvendor optimal order quantity
 #
-# Training runs are tracked in MLflow when it is installed (requirements-dev.txt);
+# Training runs are tracked in MLflow when it is installed (pip install mlflow);
 # otherwise tracking is skipped.
 # Run standalone: python ml_models.py
 # =============================================================
 
+import hashlib
+import json
 import os
 import pickle
+import shutil
 import warnings
+from datetime import datetime, timezone
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -426,8 +430,37 @@ def _log_to_mlflow(sp_artifact, dm_metrics, models_dir):
         return None
 
 
+MODEL_FILES = ("spoilage_model.pkl", "demand_models.pkl")
+MANIFEST    = "manifest.json"
+
+
+def summary_metrics(sp_artifact, dm_artifact):
+    """The three headline numbers used for alerts and champion/challenger promotion."""
+    mapes = [m["mape"] for m in dm_artifact["metrics"].values()]
+    return {"spoilage_f1":      float(sp_artifact["metrics"]["f1_score"]),
+            "survival_c_index": float(sp_artifact["survival_metrics"]["c_index"]),
+            "demand_avg_mape":  round(float(np.mean(mapes)), 2)}
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_manifest(models_dir=MODELS_DIR):
+    path = os.path.join(models_dir, MANIFEST)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 def train_all(lot_df, demand_df, models_dir=MODELS_DIR):
-    """Trains all engines, saves pickles, logs to MLflow. Returns (sp_artifact, dm_artifact)."""
+    """Trains all engines, saves pickles + a manifest (metrics, SHA-256 per file), logs to MLflow.
+    Returns (sp_artifact, dm_artifact)."""
     os.makedirs(models_dir, exist_ok=True)
 
     sp_model, le_cat, le_wh, sp_metrics, feat_imp = train_spoilage_model(lot_df)
@@ -447,11 +480,45 @@ def train_all(lot_df, demand_df, models_dir=MODELS_DIR):
     run_id = _log_to_mlflow(sp_artifact, dm_metrics, models_dir)
     if run_id:
         print(f"   📒 MLflow run: {run_id}")
+
+    manifest = {"trained_at": datetime.now(timezone.utc).isoformat(), "mlflow_run_id": run_id,
+                "metrics": summary_metrics(sp_artifact, dm_artifact),
+                "sha256": {f: _sha256(os.path.join(models_dir, f)) for f in MODEL_FILES}}
+    with open(os.path.join(models_dir, MANIFEST), "w") as f:
+        json.dump(manifest, f, indent=2)
     return sp_artifact, dm_artifact
 
 
+def regressions(candidate, champion, tolerance):
+    """Human-readable list of metrics where the candidate is worse than the champion beyond tolerance."""
+    out = []
+    if candidate["demand_avg_mape"] > champion["demand_avg_mape"] + tolerance["demand_avg_mape"]:
+        out.append(f"demand MAPE {candidate['demand_avg_mape']}% vs champion {champion['demand_avg_mape']}%")
+    for k in ("spoilage_f1", "survival_c_index"):
+        if candidate[k] < champion[k] - tolerance[k]:
+            out.append(f"{k} {candidate[k]:.3f} vs champion {champion[k]:.3f}")
+    return out
+
+
+def promote(candidate_dir, models_dir=MODELS_DIR):
+    """Replaces the champion with the candidate. The manifest moves last, so a crash midway
+    leaves a hash mismatch that load_artifacts refuses, rather than a silently mixed model set."""
+    for f in MODEL_FILES + (MANIFEST,):
+        os.replace(os.path.join(candidate_dir, f), os.path.join(models_dir, f))
+    shutil.rmtree(candidate_dir, ignore_errors=True)
+
+
 def load_artifacts(models_dir=MODELS_DIR):
-    # Pickles are only ever written by train_all() in this repo; never point this at untrusted files.
+    """Loads the champion models, refusing any pickle whose SHA-256 doesn't match the manifest."""
+    manifest = read_manifest(models_dir)
+    if manifest is None:
+        print("   ⚠️  No model manifest; loading without an integrity check (retrain to create one).")
+    for f in MODEL_FILES:
+        path = os.path.join(models_dir, f)
+        if manifest is not None and _sha256(path) != manifest["sha256"].get(f):
+            raise RuntimeError(f"{path} does not match models/manifest.json; refusing to load it. "
+                               "Retrain with: python pipeline.py --force-train")
+    # Pickles are only ever written by train_all(); the hash check above stops tampered files.
     with open(os.path.join(models_dir, "spoilage_model.pkl"), "rb") as f:
         sp = pickle.load(f)
     with open(os.path.join(models_dir, "demand_models.pkl"), "rb") as f:
