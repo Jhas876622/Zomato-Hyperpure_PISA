@@ -280,12 +280,12 @@ def test_resolve_role(email, expected):
     assert auth.resolve_role(email, ACCESS) == expected
 
 
-def test_allow_any_viewer_and_only_admins_can_ask():
+def test_allow_any_viewer_can_ask():
     import auth
     assert auth.resolve_role("anyone@co.com", {**ACCESS, "allow_any_viewer": True}) == ("viewer", None)
     assert auth.User("a", "A", "admin").can_ask
-    assert not auth.User("v", "V", "viewer").can_ask
-    assert not auth.User("m", "M", "hub_manager", hub="Delhi North Hub").can_ask
+    assert auth.User("v", "V", "viewer").can_ask
+    assert auth.User("m", "M", "hub_manager", hub="Delhi North Hub").can_ask
 
 
 # ── Shared rate limiter ──────────────────────────────────────

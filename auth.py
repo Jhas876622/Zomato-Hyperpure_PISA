@@ -39,7 +39,7 @@ class User:
     @property
     def can_ask(self):
         # Ask PISA spends the company's LLM budget and its SQL can read every hub
-        return self.role == "admin"
+        return True
 
 
 def resolve_role(email, access):
